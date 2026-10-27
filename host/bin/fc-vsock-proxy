@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# SSH ProxyCommand: connect to a guest vsock port through Firecracker's
+# hybrid vsock Unix socket. Firecracker answers "OK <port>" before relaying,
+# which the SSH client skips as a pre-banner line.
+# Usage: fc-vsock-proxy <uds-path> <guest-port>
+set -euo pipefail
+{ printf 'CONNECT %s\n' "$2"; exec cat; } | exec socat - UNIX-CONNECT:"$1"

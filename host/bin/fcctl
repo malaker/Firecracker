@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# fcctl - Firecracker security sandbox controller (runs as root inside fc-host).
+set -euo pipefail
+
+FC_HOME="${FC_HOME:-$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)}"
+for f in common state ssh net vm doctor; do
+  # shellcheck source=/dev/null
+  . "$FC_HOME/lib/$f.sh"
+done
+
+usage() {
+  cat <<'EOF'
+Usage: fcctl <command> [options]
+
+Commands:
+  doctor [--boot]            Check that this host can run microVMs (--boot also boots a test VM)
+  run --payload DIR --cmd CMD [vm options] [--results-dir DIR]
+                             Boot a VM, upload DIR to /work/in, run CMD in /work,
+                             collect /work/out and logs into <results-dir>/<run-id>/, destroy the VM
+  shell [vm options]         Boot a VM and open an interactive root shell; destroyed on exit
+  start [vm options]         Boot a VM in the background and print its run id
+  ssh <run-id> [command]     Open a shell or run a command in a started VM
+  list                       List VMs (running, dead or kept)
+  stop <run-id>              Destroy a VM (a kept VM's disk is removed too)
+  cleanup                    Destroy every VM and remove all leftovers from earlier runs
+
+VM options:
+  --net isolated|networked   Network mode (default: isolated = no network device)
+  --allow CIDR[,CIDR...]     networked only: allow egress only to these destinations
+  --vcpu N                   vCPUs (default 2)
+  --mem MIB                  Memory in MiB (default 1024)
+  --timeout DUR              Maximum lifetime, e.g. 90s, 30m, 1h (default 30m)
+  --keep                     Keep the VM's disk after it stops, for inspection
+
+Exit codes (run): the guest command's exit code, 124 on timeout, 125 on sandbox failure.
+EOF
+}
+
+# --- option parsing ---------------------------------------------------------
+OPT_NET=isolated OPT_ALLOW="" OPT_VCPU=$DEFAULT_VCPU OPT_MEM=$DEFAULT_MEM_MIB
+OPT_TIMEOUT=$DEFAULT_TIMEOUT OPT_KEEP=0 OPT_PAYLOAD="" OPT_CMD="" OPT_RESULTS="$FC_RESULTS_DEFAULT"
+OPT_BOOT=0 POSITIONAL=()
+
+parse_opts() {
+  while (( $# )); do
+    case "$1" in
+      --net)         OPT_NET="$2"; shift ;;
+      --allow)       OPT_ALLOW="$2"; shift ;;
+      --vcpu)        OPT_VCPU="$2"; shift ;;
+      --mem)         OPT_MEM="$2"; shift ;;
+      --timeout)     OPT_TIMEOUT="$(parse_duration "$2")" || die "invalid --timeout '$2'"; shift ;;
+      --keep)        OPT_KEEP=1 ;;
+      --payload)     OPT_PAYLOAD="$2"; shift ;;
+      --cmd)         OPT_CMD="$2"; shift ;;
+      --results-dir) OPT_RESULTS="$2"; shift ;;
+      --boot)        OPT_BOOT=1 ;;
+      -h|--help)     usage; exit 0 ;;
+      --*)           die "unknown option '$1'" ;;
+      *)             POSITIONAL+=("$1") ;;
+    esac
+    shift
+  done
+  case "$OPT_NET" in isolated|networked) ;; *) die "--net must be 'isolated' or 'networked'" ;; esac
+  if [ -n "$OPT_ALLOW" ]; then
+    [ "$OPT_NET" = networked ] || die "--allow only applies to --net networked"
+    local c
+    for c in ${OPT_ALLOW//,/ }; do
+      [[ "$c" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$ ]] || die "invalid CIDR '$c' in --allow"
+    done
+  fi
+  (( OPT_TIMEOUT > 0 )) || die "--timeout must be positive"
+}
+
+# Boot a VM with the parsed options; prints nothing, sets VM_ID.
+boot_vm() {
+  local lifetime="$1" slot
+  validate_resources "$OPT_VCPU" "$OPT_MEM"
+  [ -c /dev/kvm ] || die "/dev/kvm is missing; run 'fc.ps1 doctor'"
+  VM_ID="$(new_run_id)"
+  slot="$(alloc_slot "$VM_ID")" || die "no free VM slots"
+  log "starting VM $VM_ID (net=$OPT_NET vcpu=$OPT_VCPU mem=${OPT_MEM}MiB timeout=${OPT_TIMEOUT}s)"
+  if ! vm_create "$VM_ID" "$slot" "$OPT_VCPU" "$OPT_MEM" "$OPT_NET" "$OPT_ALLOW" "$lifetime" "$OPT_KEEP"; then
+    vm_destroy "$VM_ID" 1
+    die "VM $VM_ID failed to start"
+  fi
+}
+
+# --- commands ---------------------------------------------------------------
+cmd_run() {
+  [ -n "$OPT_CMD" ] || die "run needs --cmd"
+  [ -n "$OPT_PAYLOAD" ] && [ -d "$OPT_PAYLOAD" ] || die "payload directory '$OPT_PAYLOAD' not found"
+
+  local started rc=0 timed_out=false error="" out t0 elapsed
+  started="$(now_iso)"
+  boot_vm $(( OPT_TIMEOUT + COLLECT_GRACE ))
+  out="$OPT_RESULTS/$VM_ID"
+  mkdir -p "$out/out"
+  trap 'vm_destroy "$VM_ID"' EXIT
+  # Written up front (no end time yet) so the watchdog can finalise it if
+  # this controller dies before the run ends.
+  write_run_meta "$out" "$started" null false ""
+  meta_set_str "$VM_ID" results_dir "$out"
+
+  if ! upload_dir "$VM_ID" "$OPT_PAYLOAD" /work/in; then
+    rc=$EXIT_INFRA error="payload upload failed"
+  else
+    fc_ssh "$VM_ID" "mkdir -p /work/out" </dev/null || true
+    log "running: $OPT_CMD"
+    t0=$SECONDS
+    set +e
+    timeout -k 10 "$OPT_TIMEOUT" \
+      bash -c 'fc_ssh "$@"' _ "$VM_ID" "cd /work && $OPT_CMD" </dev/null \
+      > >(tee "$out/stdout.log") 2> >(tee "$out/stderr.log" >&2)
+    rc=$?
+    set -e
+    elapsed=$(( SECONDS - t0 ))
+    if (( rc == 124 || rc == 137 )) && (( elapsed >= OPT_TIMEOUT )); then
+      rc=$EXIT_TIMEOUT timed_out=true
+      log "timed out after ${OPT_TIMEOUT}s"
+    elif (( rc == 255 )) && ! vm_alive "$VM_ID"; then
+      rc=$EXIT_INFRA error="VM died during the run"
+    fi
+  fi
+  download_dir "$VM_ID" /work/out "$out/out"
+  echo "$rc" > "$out/exit_code"
+  write_run_meta "$out" "$started" "$rc" "$timed_out" "$error"
+  [ -z "$error" ] || log "error: $error"
+  log "results: $out (exit code $rc)"
+  exit "$rc"
+}
+
+# write_run_meta <dir> <started> <exit-code|null> <timed-out> <error>
+# An exit code of null means the run is still in progress (no ended_at).
+write_run_meta() {
+  jq -n --arg id "$VM_ID" --arg cmd "$OPT_CMD" --arg payload "$OPT_PAYLOAD" --arg net "$OPT_NET" \
+    --arg allow "$OPT_ALLOW" --argjson vcpu "$OPT_VCPU" --argjson mem "$OPT_MEM" \
+    --argjson timeout "$OPT_TIMEOUT" --arg started "$2" --arg ended "$(now_iso)" \
+    --argjson rc "$3" --argjson timed_out "$4" --arg error "$5" \
+    --arg fc "${FC_VERSION:-}" --argjson keep "$OPT_KEEP" \
+    '{run_id:$id, command:$cmd, payload:$payload, net:$net, allow:$allow, vcpu:$vcpu,
+      mem_mib:$mem, timeout_sec:$timeout, started_at:$started,
+      ended_at:(if $rc == null then null else $ended end),
+      exit_code:$rc, timed_out:$timed_out, error:(if $error == "" then null else $error end),
+      keep_disk:($keep==1), firecracker:$fc}' > "$1/meta.json"
+}
+
+# `timeout` runs fc_ssh through `bash -c`, which needs these exported.
+export -f fc_ssh vsock_path
+export FC_SSH_KEY FC_HOME FC_JAIL_BASE
+
+cmd_shell() {
+  boot_vm "$OPT_TIMEOUT"
+  trap 'vm_destroy "$VM_ID"' EXIT
+  log "VM $VM_ID ready; exit the shell to destroy it"
+  set +e
+  fc_ssh "$VM_ID" -t
+  set -e
+}
+
+cmd_start() {
+  boot_vm "$OPT_TIMEOUT"
+  echo "$VM_ID"
+}
+
+cmd_ssh() {
+  local id="${POSITIONAL[0]:-}"
+  [ -n "$id" ] && vm_exists "$id" && vm_alive "$id" || die "no running VM '$id'"
+  if (( ${#POSITIONAL[@]} > 1 )); then
+    fc_ssh "$id" "${POSITIONAL[@]:1}"
+  else
+    fc_ssh "$id" -t
+  fi
+}
+
+cmd_list() {
+  local id state
+  printf '%-22s %-8s %-10s %-5s %-7s %-20s %s\n' RUN-ID STATE NET VCPU MEM STARTED ALLOW
+  for id in $(list_vm_ids); do
+    state="$(meta_get "$id" state)"
+    if [ "$state" != kept ] && ! vm_alive "$id"; then state=dead; fi
+    printf '%-22s %-8s %-10s %-5s %-7s %-20s %s\n' "$id" "$state" "$(meta_get "$id" net)" \
+      "$(meta_get "$id" vcpu)" "$(meta_get "$id" mem_mib)M" "$(meta_get "$id" started_at)" \
+      "$(meta_get "$id" allow)"
+  done
+}
+
+cmd_stop() {
+  local id="${POSITIONAL[0]:-}"
+  [ -n "$id" ] && { vm_exists "$id" || [ -d "$(jail_dir "$id")" ]; } || die "unknown VM '$id'"
+  vm_destroy "$id" 1
+  log "stopped $id"
+}
+
+cmd_cleanup() {
+  local id pid d tap chain root
+  for id in $(list_vm_ids); do vm_destroy "$id" 1; done
+  # Orphans that have no state left (e.g. the controller was killed mid-start).
+  for pid in $(pgrep -x firecracker || true); do
+    # The jailer pivots into the jail, so its root mount's source is the jail dir.
+    root="$(awk '$5 == "/" {print $4; exit}' "/proc/$pid/mountinfo" 2>/dev/null || true)"
+    case "$root" in "$FC_JAIL_BASE"/*) kill -KILL "$pid" 2>/dev/null || true ;; esac
+  done
+  for pid in $(pgrep -f "fcctl'? _expire" || true); do kill "$pid" 2>/dev/null || true; done
+  sleep 0.3
+  for d in "$FC_JAIL_BASE"/firecracker/*/; do [ -d "$d" ] && rm -rf "$d"; done
+  for d in /sys/fs/cgroup/"$FC_CGROUP_PARENT"/*/; do [ -d "$d" ] && rmdir "$d" 2>/dev/null || true; done
+  for tap in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 | grep "^$FC_TAP_PREFIX" || true); do
+    net_down "${tap#"$FC_TAP_PREFIX"}"
+  done
+  for chain in $(nft list table $FC_NFT_TABLE 2>/dev/null | awk '$1=="chain" && $2 ~ /^vm-/ {print $2}'); do
+    net_down "${chain#vm-}"
+  done
+  rm -rf "${FC_VMS:?}"/*
+  log "cleanup complete"
+}
+
+# Internal: called by the watchdog when a VM's lifetime is over.
+cmd_expire() {
+  local id="${POSITIONAL[0]:-}"
+  vm_exists "$id" || exit 0
+  [ "$(meta_get "$id" state)" = kept ] && exit 0
+  log "VM $id reached its timeout; destroying"
+  meta_set "$id" timed_out true
+  # Finalise the results of a run whose controller is gone.
+  local res
+  res="$(meta_get "$id" results_dir)"
+  if [ -n "$res" ] && [ -f "$res/meta.json" ] && [ "$(jq -r '.ended_at' "$res/meta.json")" = null ]; then
+    jq --arg ended "$(now_iso)" --argjson rc "$EXIT_TIMEOUT" \
+      '.ended_at = $ended | .exit_code = $rc | .timed_out = true
+       | .error = "controller exited before the run finished; stopped by the watchdog"' \
+      "$res/meta.json" > "$res/meta.json.tmp" && mv "$res/meta.json.tmp" "$res/meta.json"
+    echo "$EXIT_TIMEOUT" > "$res/exit_code"
+  fi
+  vm_destroy "$id"
+}
+
+# --- main -------------------------------------------------------------------
+main() {
+  # fc.ps1 passes all arguments as one base64 blob of NUL-separated values,
+  # which avoids wsl.exe re-quoting commands that contain spaces or quotes.
+  if [ "${1:-}" = "--argv-b64" ]; then
+    local decoded=()
+    mapfile -d '' decoded < <(printf '%s' "$2" | base64 -d)
+    set -- "${decoded[@]}"
+  fi
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in ""|-h|--help|help) usage; exit 0 ;; esac
+  require_root
+  parse_opts "$@"
+  case "$cmd" in
+    doctor)  doctor "$OPT_BOOT" ;;
+    run)     cmd_run ;;
+    shell)   cmd_shell ;;
+    start)   cmd_start ;;
+    ssh)     cmd_ssh ;;
+    list)    cmd_list ;;
+    stop)    cmd_stop ;;
+    cleanup) cmd_cleanup ;;
+    _expire) cmd_expire ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,15 @@
+# Run results and downloaded/built artifacts
+runs/
+.cache/
+*.ext4
+*.squashfs
+
+# Local tool settings
+.claude/settings.local.json
+
+# OS / editor noise
+Thumbs.db
+Desktop.ini
+.DS_Store
+.vscode/
+*.swp
