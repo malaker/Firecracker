@@ -1,6 +1,7 @@
 # Run results and downloaded/built artifacts
 runs/
 .cache/
+/externalimages/
 *.ext4
 *.squashfs
 
@@ -13,3 +14,7 @@ Desktop.ini
 .DS_Store
 .vscode/
 *.swp
+
+# .NET build output (windows/egress)
+windows/egress/**/bin/
+windows/egress/**/obj/

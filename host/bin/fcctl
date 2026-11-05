@@ -63,9 +63,16 @@ parse_opts() {
   case "$OPT_NET" in isolated|networked) ;; *) die "--net must be 'isolated' or 'networked'" ;; esac
   if [ -n "$OPT_ALLOW" ]; then
     [ "$OPT_NET" = networked ] || die "--allow only applies to --net networked"
-    local c
+    local c o
     for c in ${OPT_ALLOW//,/ }; do
-      [[ "$c" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$ ]] || die "invalid CIDR '$c' in --allow"
+      [[ "$c" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})(/([0-9]{1,2}))?$ ]] \
+        || die "invalid CIDR '$c' in --allow"
+      # Reject out-of-range values here rather than as an nft error after the tap exists.
+      for o in "${BASH_REMATCH[@]:1:4}"; do
+        (( 10#$o <= 255 )) || die "invalid CIDR '$c' in --allow: octet $o is above 255"
+      done
+      [ -z "${BASH_REMATCH[6]}" ] || (( 10#${BASH_REMATCH[6]} <= 32 )) \
+        || die "invalid CIDR '$c' in --allow: prefix /${BASH_REMATCH[6]} is above 32"
     done
   fi
   (( OPT_TIMEOUT > 0 )) || die "--timeout must be positive"
