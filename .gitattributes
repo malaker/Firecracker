@@ -2,6 +2,6 @@
 *.sh text eol=lf
 host/bin/* text eol=lf
 *.env text eol=lf
-# PowerShell scripts are Authenticode-signed over their exact bytes: store and check them
-# out unchanged, or a clone's line-ending conversion turns every signature into HashMismatch.
+# PowerShell scripts are stored and checked out byte-for-byte, so a clone gets exactly the
+# committed bytes (and a signature added locally under AllSigned is not broken by git).
 *.ps1 -text
