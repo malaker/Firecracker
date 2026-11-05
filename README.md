@@ -39,7 +39,6 @@ flowchart LR
 - **Hard timeouts.** A detached watchdog enforces every VM's lifetime, even if the controller crashes.
 - **Two network modes.** `isolated` has no network device at all. `networked` has controlled egress with the host and private ranges blocked, plus an optional destination allowlist: NAT-ed through nftables for Linux guests, and through a host-side egress proxy for Windows guests, which still have no network adapter.
 - **Simple results.** Each run's exit code, stdout/stderr, metadata and output files are collected into `runs\<run-id>\` on Windows.
-- **Signed scripts.** All PowerShell scripts are Authenticode-signed and timestamped.
 
 ## Requirements
 
@@ -300,7 +299,7 @@ Repository layout:
 | [tests/smoke/](tests/smoke/), [tests/smoke-win/](tests/smoke-win/) | End-to-end smoke tests for Linux and Windows microVMs |
 | [openspec/](openspec/) | Specifications and design/planning documents |
 
-The PowerShell scripts are Authenticode-signed. Any edit invalidates the signature, so modified scripts must be re-signed, or run under an execution policy that permits unsigned local scripts. [.gitattributes](.gitattributes) stores `*.ps1` byte-for-byte (`-text`), so git never converts their line endings and a clone keeps the exact signed bytes.
+The PowerShell scripts are not signed. A `git clone` runs as-is under the default `RemoteSigned` execution policy. If you downloaded the repository as a ZIP, Windows marks the files as coming from the internet and `RemoteSigned` blocks them: unblock them once with `Get-ChildItem -Recurse | Unblock-File`, or run with `-ExecutionPolicy Bypass`. Hosts that enforce `AllSigned` must sign the scripts with their own certificate. [.gitattributes](.gitattributes) stores `*.ps1` byte-for-byte (`-text`), so git never converts their line endings.
 
 ## Responsible use
 
