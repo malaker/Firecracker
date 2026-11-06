@@ -140,15 +140,17 @@ function Remove-FcWinVmNetworkPolicy([string]$RunId) {
 
 # Removes what versions before the egress proxy left behind: per-VM 'fc-win-*' firewall
 # rules and the 'fc-win-nat' HNS NAT network. Nothing creates either any more.
-function Clear-AllFcWinNetworkPolicies([string]$WinRuntime = 'docker') {
+# Covers every installed runtime; a runtime whose CLI is not installed is skipped.
+function Clear-AllFcWinNetworkPolicies {
     if ((Test-FcAdmin) -and (Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue)) {
         $rules = Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.Group -like 'fc-win-*' }
         if ($rules) {
             $rules | Remove-NetFirewallRule -ErrorAction SilentlyContinue | Out-Null
         }
     }
-    $cli = Get-FcCli $WinRuntime
-    if (Test-Path -LiteralPath $cli) {
+    foreach ($rt in $script:VALID_WIN_RUNTIMES) {
+        $cli = Get-FcCli $rt
+        if (-not (Test-Path -LiteralPath $cli)) { continue }
         $insp = Invoke-FcNative -Exe $cli -ArgList @('network', 'inspect', $script:LEGACY_NAT_NAME)
         if ($insp.ExitCode -eq 0) {
             [void](Invoke-FcNative -Exe $cli -ArgList @('network', 'rm', $script:LEGACY_NAT_NAME))

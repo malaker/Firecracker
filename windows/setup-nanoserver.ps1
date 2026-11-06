@@ -60,9 +60,7 @@ function Invoke-VerifiedDownload([string]$Name, [string]$Url, [string]$ExpectedS
 
 # 1. Check early if -BuildFromSource was requested with a missing source directory or unsupported runtime.
 if ($BuildFromSource) {
-    if ($WinRuntime -ne 'docker') {
-        Stop-FcWithError "-BuildFromSource requires '-WinRuntime docker': nerdctl builds require BuildKit, which has no supported Windows container builder." 1
-    }
+    Assert-FcWinFeatureSupported 'build-from-source' $WinRuntime
     $resolvedSrc = Resolve-FcNanoserverSourceDir $SourceDir $Flavour
     if (-not $resolvedSrc) {
         Stop-FcWithError "Nano Server source directory '$SourceDir' not found or missing nanoserver-$Flavour\Dockerfile. Clone https://github.com/malaker/nanoserver into '$SourceDir' or link C:\sources\nanoserver (e.g. cmd /c mklink /J `"$SourceDir`" C:\sources\nanoserver)." 1

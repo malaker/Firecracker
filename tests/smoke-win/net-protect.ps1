@@ -2,6 +2,7 @@
 # host/LAN protection against the host's real addresses and listening ports, allowlist, net.log
 # and teardown. Every "blocked" check has a positive control, so a probe that cannot reach
 # anything never passes by accident.
+param([ValidateSet('docker', 'containerd')][string]$WinRuntime = 'docker')
 $ErrorActionPreference = 'Stop'
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $FcPs1    = Join-Path $RepoRoot 'fc.ps1'
@@ -11,13 +12,19 @@ $FcPs1    = Join-Path $RepoRoot 'fc.ps1'
 . (Join-Path $RepoRoot 'windows\lib\runtime.ps1')
 . (Join-Path $RepoRoot 'windows\lib\egress.ps1')
 . (Join-Path $RepoRoot 'windows\lib\net.ps1')
+. (Join-Path $PSScriptRoot 'smoke-lib.ps1')
 
-$cli   = Get-FcCli 'docker'
+if (Invoke-FcSmokeLimitationSkip 'networked' $WinRuntime $FcPs1 'networked mode tests') {
+    Write-Host "[smoke-win:net-protect] PASS (skipped on $WinRuntime)"
+    return
+}
+
+$cli   = Get-FcCli $WinRuntime
 $proxy = "http://127.0.0.1:$($script:RELAY_PORT)"
 
 function Start-FcSmokeNetworkedVm([string[]]$ExtraArgs = @()) {
     $ErrorActionPreference = 'Continue'
-    $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $FcPs1 start -Guest windows -Net networked @ExtraArgs 2>&1
+    $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $FcPs1 start -Guest windows -WinRuntime $WinRuntime -Net networked @ExtraArgs 2>&1
     $rc = $LASTEXITCODE
     $id = $raw | ForEach-Object { "$_".Trim() } | Where-Object { $_ -match '^\d{8}-\d{6}-[0-9a-f]{4}$' } | Select-Object -Last 1
     if ($rc -ne 0 -or -not $id) { throw "Networked start failed (exit $rc): $(($raw | ForEach-Object { "$_" }) -join ' ')" }
@@ -63,7 +70,7 @@ function Assert-FcSmokeDenied([string]$RunId, [string]$Ip, [int]$Port, [string]$
 
 function Stop-FcSmokeVm([string]$RunId) {
     $meta = Get-FcWinVmMeta $RunId
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $FcPs1 stop $RunId -Guest windows | Out-Null
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $FcPs1 stop $RunId -Guest windows -WinRuntime $WinRuntime | Out-Null
     if (Test-Path -LiteralPath (Get-FcWinNetPolicyPath $RunId)) { throw "Network policy for $RunId was not removed on stop" }
     foreach ($pidValue in @($meta.egress_pid, $meta.relay_exec_pid)) {
         if ($pidValue -and (Get-Process -Id ([int]$pidValue) -ErrorAction SilentlyContinue)) {

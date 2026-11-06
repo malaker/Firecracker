@@ -3,16 +3,25 @@
 # Usage (from Windows): wsl -d fc-host -u root -e bash /mnt/c/sources/Firecracker/tests/smoke/all.sh
 set -uo pipefail
 dir="$(cd "$(dirname "$0")" && pwd)"
+# Checks the environment once, before any part or controller call; exits 125 if unsuitable.
+. "$dir/lib.sh"
 failed=()
 
 for t in boot resources lifecycle net run timeout; do
-  bash "$dir/$t.sh" || failed+=("$t")
+  bash "$dir/$t.sh"
+  rc=$?
+  if (( rc == 125 )); then
+    echo "SMOKE TESTS ABORTED: $t could not run in this environment" >&2
+    rm -rf "$RESULTS"
+    exit 125
+  fi
+  (( rc )) && failed+=("$t")
 done
 
-/opt/fc-sandbox/bin/fcctl cleanup 2>/dev/null
-. "$dir/lib.sh"
+"$FCCTL" cleanup 2>/dev/null
 expect "final cleanup leaves nothing behind" no_leftovers
 expect "final list is empty" test "$("$FCCTL" list | wc -l)" = 1
+rm -rf "$RESULTS"
 (( FAILS )) && failed+=(final)
 
 if (( ${#failed[@]} )); then

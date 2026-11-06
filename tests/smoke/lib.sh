@@ -2,6 +2,38 @@
 set -uo pipefail
 
 FCCTL="${FCCTL:-/opt/fc-sandbox/bin/fcctl}"
+FC_BASE_IMAGE=/opt/fc-sandbox/images/rootfs.ext4
+FC_SMOKE_HOST_TOOLS="jq ip nft pgrep socat sha256sum timeout awk"
+
+# Refuses to run anywhere the checks cannot actually test something. Negative checks
+# ("guest cannot reach X", "no leftovers") pass trivially when there is no VM or tool,
+# so a wrong environment must produce no results at all, not a mix of ok and FAIL.
+smoke_preflight() {
+  local missing=()
+  if [ "$(uname -s 2>/dev/null)" != Linux ]; then
+    missing+=("Linux (this is $(uname -s 2>/dev/null || echo 'not Linux'))")
+  else
+    [ "$(id -u)" = 0 ] || missing+=("root (run with 'wsl ... -u root')")
+    [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] || missing+=("read/write /dev/kvm")
+    [ -x "$FCCTL" ] || missing+=("controller $FCCTL")
+    [ -f "$FC_BASE_IMAGE" ] || missing+=("base image $FC_BASE_IMAGE")
+    local t
+    for t in $FC_SMOKE_HOST_TOOLS; do
+      command -v "$t" >/dev/null 2>&1 || missing+=("host tool '$t'")
+    done
+  fi
+  (( ${#missing[@]} )) || return 0
+  {
+    echo "smoke tests cannot run here; missing:"
+    printf '  - %s\n' "${missing[@]}"
+    echo "Run them inside the provisioned fc-host distro as root, from PowerShell:"
+    echo "  wsl -d fc-host -u root -e bash /mnt/c/sources/Firecracker/tests/smoke/all.sh"
+    echo "If fc-host or the controller is missing, run '.\\fc.ps1 setup' first."
+  } >&2
+  exit 125
+}
+smoke_preflight
+
 RESULTS="$(mktemp -d /tmp/fc-smoke.XXXXXX)"
 FAILS=0
 

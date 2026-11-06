@@ -37,8 +37,12 @@ function Invoke-WinDoctor {
     }
 
     Write-Host "fc-sandbox Windows preflight (runtime=$WinRuntime, image=$imageRef)"
-    if ($WinRuntime -eq 'containerd') {
-        Write-Host "  [NOTE] runtime 'containerd' (nerdctl + runhcs-v1) is experimental on Windows; '-WinRuntime docker' is recommended."
+    $limitations = @(Get-FcWinRuntimeLimitations $WinRuntime)
+    if ($limitations.Count -gt 0) {
+        Write-Host "  [NOTE] not supported with runtime '$WinRuntime' (use '-WinRuntime docker' for these):"
+        foreach ($lim in $limitations) {
+            Write-Host "         $($lim.Flag): $($lim.Reason)"
+        }
     }
 
     Test-Check "running as Administrator" `

@@ -118,6 +118,34 @@ function Assert-ValidWinRuntime([string]$WinRuntime) {
     }
 }
 
+# The one list of features a runtime backend cannot support. The controller and setup refuse
+# them up front (Assert-FcWinFeatureSupported), doctor prints them, the smoke suite skips and
+# probes them, and README's "containerd limitations" section mirrors this list.
+$script:WIN_RUNTIME_LIMITATIONS = @(
+    [pscustomobject]@{
+        Feature  = 'build-from-source'
+        Flag     = '-BuildFromSource'
+        Runtimes = @('containerd')
+        Reason   = 'nerdctl builds need BuildKit, which has no supported Windows container builder'
+    }
+)
+
+function Get-FcWinRuntimeLimitations([string]$WinRuntime) {
+    @($script:WIN_RUNTIME_LIMITATIONS | Where-Object { $_.Runtimes -contains $WinRuntime })
+}
+
+function Test-FcWinFeatureSupported([string]$Feature, [string]$WinRuntime) {
+    -not (Get-FcWinRuntimeLimitations $WinRuntime | Where-Object { $_.Feature -eq $Feature })
+}
+
+# Exits 125 before anything is started or changed when $Feature is unsupported on $WinRuntime.
+function Assert-FcWinFeatureSupported([string]$Feature, [string]$WinRuntime) {
+    $lim = Get-FcWinRuntimeLimitations $WinRuntime | Where-Object { $_.Feature -eq $Feature } | Select-Object -First 1
+    if ($lim) {
+        Stop-FcWithError "$($lim.Flag) is not supported with -WinRuntime ${WinRuntime}: $($lim.Reason). Use -WinRuntime docker." $script:EXIT_INFRA
+    }
+}
+
 # Returns the normalised list of IPv4 CIDRs (bare addresses become /32).
 function Assert-ValidCidrList([string]$AllowCsv) {
     $cidrs = @()

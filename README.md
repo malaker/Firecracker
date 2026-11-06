@@ -145,6 +145,33 @@ Remove-Item -Recurse -Force C:\ProgramData\fc-sandbox-win -ErrorAction SilentlyC
 # setup also writes DNS servers into C:\ProgramData\docker\config\daemon.json; remove that file if nothing else uses Docker
 ```
 
+### containerd backend (`-WinRuntime containerd`, experimental)
+
+`docker` is the default and recommended Windows runtime. `containerd` (containerd + `nerdctl` + `containerd-shim-runhcs-v1`) can be installed alongside it with `.\fc.ps1 setup -Guest windows -WinRuntime containerd`. Any command given `-WinRuntime` uses that runtime, whatever the configured default. The full Windows smoke suite runs against it with `.\tests\smoke-win\all.ps1 -WinRuntime containerd`.
+
+containerd limitations (`.\fc.ps1 doctor -Guest windows -WinRuntime containerd` prints the same list). Requesting one of these with `-WinRuntime containerd` exits 125 before anything is started:
+
+- `-BuildFromSource`: nerdctl builds need BuildKit, which has no supported Windows container builder.
+
+containerd keeps its own image store, so it pulls a second copy of the Nano Server image (several GB) into `C:\ProgramData\containerd`. Setup can only pull images that are published to a registry. An image you built locally with `-BuildFromSource` (always on `docker`) exists only in Docker's store; copy each flavour you need into containerd by hand (elevated), then re-run setup for containerd:
+
+```powershell
+$bin = 'C:\ProgramData\fc-sandbox-win\bin'
+& $bin\docker.exe save -o "$env:TEMP\nano.tar" malaker/nanoserver:aspnet-x86
+& $bin\nerdctl.exe load -i "$env:TEMP\nano.tar"; Remove-Item "$env:TEMP\nano.tar"
+```
+
+To remove containerd and keep Docker (elevated):
+
+```powershell
+.\fc.ps1 cleanup -Guest windows
+Stop-Service containerd
+& C:\ProgramData\fc-sandbox-win\bin\containerd.exe --unregister-service
+Remove-Item -Force C:\ProgramData\fc-sandbox-win\bin\containerd*.exe, C:\ProgramData\fc-sandbox-win\bin\nerdctl.exe, C:\ProgramData\fc-sandbox-win\bin\ctr.exe -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force C:\ProgramData\containerd
+.\fc.ps1 setup -Guest windows -WinRuntime docker    # make docker the default again if needed
+```
+
 ## Commands
 
 | Command | Description |
@@ -258,7 +285,7 @@ Inside the guest the payload is at `/work/in` (Linux) or `C:\work\in` (Windows) 
 - **Windows (Hyper-V Utility VM):** Every Windows guest runs with `--isolation=hyperv` inside a dedicated Hyper-V Utility VM (`vmwp.exe`) with its own Windows kernel, and files are streamed in and out via `tar.exe` over `HVSocket` rather than mounting a writable host directory. It does not defend against Hyper-V (`vmwp.exe` / VMBus) escape vulnerabilities. Compared with the Linux path there is one layer fewer (no surrounding WSL VM), and the host components that carry guest exec traffic (`vmcompute.exe`, `dockerd.exe`) run as `SYSTEM`.
 - **Windows networked mode is enforced by the egress proxy, not by Windows networking.** Windows 11 accepts HNS endpoint ACLs on NAT networks but doesn't enforce them, and Windows Firewall rules don't reliably filter traffic forwarded from containers. An earlier HNS-based design let guests reach the LAN and host services. The proxy is the only new host code that reads guest data: it parses fixed-size binary frames (no HTTP), limits frame size, stream count and idle time, and runs without admin rights. It sees only TCP connection requests, not traffic inside TLS.
 - **Administrator requirement on Windows:** Running `-Guest windows` commands requires an elevated (Administrator) PowerShell prompt because the Windows Docker engine named pipe is administrator-only. The egress proxy drops those rights before it handles any guest data.
-- **Experimental `containerd` backend on Windows:** `-WinRuntime docker` is the default and recommended backend. `-WinRuntime containerd` (`nerdctl` + `runhcs-v1`) is experimental: `-BuildFromSource` requires `docker` (BuildKit has no native Windows container builder), and networked mode has only been tested with `docker`.
+- **Experimental `containerd` backend on Windows:** `-WinRuntime docker` is the default and recommended backend. `-WinRuntime containerd` is experimental; see [containerd backend](#containerd-backend--winruntime-containerd-experimental) for what it does not support.
 - **WSL lifecycle (`-Guest linux`):** Linux VMs run inside WSL. `wsl --shutdown`, or Windows stopping WSL, terminates them; `list` then shows them as `dead` and `cleanup` removes the leftovers.
 - **Startup and disk overhead:** Each Linux VM receives a full sparse copy of the 2 GiB base image (about 1-2 seconds), and nested virtualization is slower than bare metal. Each Windows VM creates an ephemeral Hyper-V container scratch layer (`sandbox.vhdx`).
 - **Shared WSL2 network namespace (`-Guest linux`):** All WSL2 distros share one network namespace. The `inet fc_sandbox` nftables table matches only `fc-tap-*` interfaces and `172.30.0.0/16`, so other distros are unaffected; avoid using `172.30.0.0/16` elsewhere.
@@ -270,15 +297,21 @@ Inside the guest the payload is at `/work/in` (Linux) or `C:\work\in` (Windows) 
 Run the end-to-end smoke tests from the repository root:
 
 ```powershell
-# Linux Firecracker smoke tests (inside fc-host, about 5 minutes)
-wsl -d fc-host -u root -e bash tests/smoke/all.sh
+# Linux Firecracker smoke tests (inside fc-host as root, about 5 minutes)
+wsl -d fc-host -u root -e bash /mnt/c/sources/Firecracker/tests/smoke/all.sh
 
 # Windows Nano Server microVM smoke tests (in an elevated PowerShell prompt)
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\smoke-win\all.ps1
+# ...against the containerd backend instead of docker (installs it alongside docker if needed)
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\smoke-win\all.ps1 -WinRuntime containerd
 
 # Egress proxy / relay unit and integration tests (no VM or elevation needed; .NET 10 SDK)
 dotnet test windows\egress
 ```
+
+The Linux suite must run inside the provisioned `fc-host` distro as root. It checks that first: anywhere else (Git Bash, another distro, a non-root user, or before `.\fc.ps1 setup`) it lists what is missing and exits 125 without reporting any check results. A single part, such as `tests/smoke/net.sh`, can be run the same way. The suite tests the controller installed in `/opt/fc-sandbox`, so after changing anything under `host\`, re-run `.\fc.ps1 setup` before testing.
+
+The Windows suite and each of its parts (`net-isolated.ps1`, `lifecycle.ps1`, `net-protect.ps1`) take `-WinRuntime docker|containerd`, default `docker`, and run every command against that backend. `all.ps1` runs `setup` for the selected runtime, which changes the host's default runtime, image repository and flavour; it restores the previous `config.json` when it finishes, passes or fails. If the suite process is killed outright, re-run `.\fc.ps1 setup -Guest windows -WinRuntime docker` to reset the default.
 
 After changing anything under `windows\egress`, re-run `.\fc.ps1 setup -Guest windows`: VMs use the binaries it publishes to `C:\ProgramData\fc-sandbox-win\bin\egress\`, not the ones in the repository's build folders.
 

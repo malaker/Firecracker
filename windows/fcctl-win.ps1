@@ -100,6 +100,8 @@ try {
 } catch {
     Stop-FcWithError $_.Exception.Message $script:EXIT_INFRA
 }
+# Refuse features the selected runtime cannot support before anything is started.
+if ($Net -eq 'networked') { Assert-FcWinFeatureSupported 'networked' $WinRuntime }
 
 function Complete-FcWinRunResults {
     param(
