@@ -208,9 +208,7 @@ function Resolve-FcNanoserverSourceDir([string]$SourceRoot, [string]$Flavour) {
 }
 
 function Invoke-FcWinImageBuild([string]$WinRuntime, [string]$SourceRoot, [string]$Flavour, [string]$ImageRef, [string]$NanoBase) {
-    if ($WinRuntime -ne 'docker') {
-        throw "-BuildFromSource needs '-WinRuntime docker': nerdctl builds need BuildKit, which has no supported Windows container builder."
-    }
+    Assert-FcWinFeatureSupported 'build-from-source' $WinRuntime
     $root = Resolve-FcNanoserverSourceDir $SourceRoot $Flavour
     if (-not $root) {
         throw "Nano Server source tree not found under '$SourceRoot' (expected nanoserver-$Flavour\Dockerfile)."
@@ -275,16 +273,31 @@ function Start-FcWinMicroVm {
     )
     $name = Get-FcContainerName $RunId
     $cli = Get-FcCli $WinRuntime
-    $runArgs = @(
-        'run', '-d', '-i', '--name', $name,
-        '--isolation=hyperv',
-        "--cpus=$Vcpu", "--memory=${MemMib}m",
-        '-u', $script:GUEST_USER,
-        # No network adapter in either mode: networked guests reach the network only through
-        # the egress proxy over the exec channel (see net.ps1).
-        '--network=none'
-    )
-    $runArgs += @('--entrypoint', 'cmd.exe', $ImageRef, '/Q', '/K')
+    # No network adapter in either mode: networked guests reach the network only through
+    # the egress proxy over the exec channel (see net.ps1).
+    if ($WinRuntime -eq 'docker') {
+        $runArgs = @(
+            'run', '-d', '-i', '--name', $name,
+            '--isolation=hyperv',
+            "--cpus=$Vcpu", "--memory=${MemMib}m",
+            '-u', $script:GUEST_USER,
+            '--network=none',
+            '--entrypoint', 'cmd.exe', $ImageRef, '/Q', '/K'
+        )
+    } else {
+        # nerdctl 2.0 rejects '-d' with '-i', so 'cmd /K' would exit at once on closed stdin: keep
+        # the guest alive with a command that never exits. Its '--memory' makes HCS refuse to
+        # create the Utility VM, so size the VM with hcsshim's own annotations instead.
+        $runArgs = @(
+            'run', '-d', '--name', $name,
+            '--isolation=hyperv',
+            '--annotation', "io.microsoft.virtualmachine.computetopology.processor.count=$Vcpu",
+            '--annotation', "io.microsoft.virtualmachine.computetopology.memory.sizeinmb=$MemMib",
+            '-u', $script:GUEST_USER,
+            '--network=none',
+            '--entrypoint', 'cmd.exe', $ImageRef, '/S', '/C', 'ping -t 127.0.0.1 >nul'
+        )
+    }
 
     $r = Invoke-FcNative -Exe $cli -ArgList $runArgs
     if ($r.ExitCode -ne 0) {
@@ -407,13 +420,42 @@ function Invoke-FcWinGuestCommand {
         Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    $rc = Invoke-FcRuntimeProcess -WinRuntime $WinRuntime -StdoutFile $StdoutPath -StderrFile $StderrPath -Echo -TimeoutSec $TimeoutSec -ArgList (
-        @('exec', '-u', $script:GUEST_USER, '-w', 'C:\work') + (Get-FcWinGuestEnvArgs $RunId) +
-        @((Get-FcContainerName $RunId), 'cmd.exe', '/S', '/C', "C:\work\.fc\$scriptName"))
-    if ($rc -eq [FcProc]::TimedOut) {
-        return @{ ExitCode = $script:EXIT_TIMEOUT; TimedOut = $true }
+    # nerdctl exits 1 for any non-zero guest exit code and reports the real one only on its own
+    # stderr, so on containerd stderr is always captured to a file to read it back.
+    $errFile = $StderrPath
+    $tmpErr = $null
+    if ($WinRuntime -eq 'containerd' -and -not $errFile) {
+        $tmpErr = [System.IO.Path]::GetTempFileName()
+        $errFile = $tmpErr
     }
-    return @{ ExitCode = $rc; TimedOut = $false }
+    try {
+        $rc = Invoke-FcRuntimeProcess -WinRuntime $WinRuntime -StdoutFile $StdoutPath -StderrFile $errFile -Echo -TimeoutSec $TimeoutSec -ArgList (
+            @('exec', '-u', $script:GUEST_USER, '-w', 'C:\work') + (Get-FcWinGuestEnvArgs $RunId) +
+            @((Get-FcContainerName $RunId), 'cmd.exe', '/S', '/C', "C:\work\.fc\$scriptName"))
+        if ($rc -eq [FcProc]::TimedOut) {
+            return @{ ExitCode = $script:EXIT_TIMEOUT; TimedOut = $true }
+        }
+        if ($WinRuntime -eq 'containerd' -and $rc -eq 1) {
+            $rc = Resolve-FcNerdctlExecExitCode -StderrFile $errFile -Fallback $rc
+        }
+        return @{ ExitCode = $rc; TimedOut = $false }
+    } finally {
+        if ($tmpErr) { Remove-Item -LiteralPath $tmpErr -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+# nerdctl 2.0 ends a failed exec with 'level=fatal msg="exec failed with exit code N"' on its
+# stderr. Returns N and removes that line, so the file keeps only the guest's own stderr.
+function Resolve-FcNerdctlExecExitCode([string]$StderrFile, [int]$Fallback) {
+    if (-not $StderrFile -or -not (Test-Path -LiteralPath $StderrFile)) { return $Fallback }
+    # ISO-8859-1 maps every byte to one char and back, so guest output in any code page
+    # survives unchanged; only nerdctl's own trailing line is cut.
+    $latin1 = [System.Text.Encoding]::GetEncoding(28591)
+    $text = $latin1.GetString([System.IO.File]::ReadAllBytes($StderrFile))
+    $m = [regex]::Match($text, '(?:\r?\n|^)time="[^"]*" level=fatal msg="exec failed with exit code (\d+)"\r?\n?$')
+    if (-not $m.Success) { return $Fallback }
+    [System.IO.File]::WriteAllBytes($StderrFile, $latin1.GetBytes($text.Substring(0, $m.Index)))
+    return [int]$m.Groups[1].Value
 }
 
 function Invoke-FcWinInteractiveShell([string]$RunId, [string]$WinRuntime) {
