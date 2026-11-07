@@ -18,3 +18,7 @@ Desktop.ini
 # .NET build output (windows/egress)
 windows/egress/**/bin/
 windows/egress/**/obj/
+
+# .NET build output (airlock)
+airlock/**/bin/
+airlock/**/obj/

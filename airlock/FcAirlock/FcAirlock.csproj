@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- fc-airlock: 'validate' inside the airlock VM, 'unpack' on the host.
+       Published self-contained (single file, trimmed) for linux-x64 and win-x64 by setup,
+       so it runs in the stock guest images without a .NET runtime. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>fc-airlock</AssemblyName>
+    <RootNamespace>FcAirlock</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <UseSystemResourceKeys>true</UseSystemResourceKeys>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\FcAirlock.Core\FcAirlock.Core.csproj" />
+  </ItemGroup>
+
+</Project>

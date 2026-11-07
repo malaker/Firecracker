@@ -33,8 +33,5 @@ upload_dir() {
   tar -C "$2" -cf - . | fc_ssh "$1" "mkdir -p '$3' && tar -C '$3' -xf -"
 }
 
-# download_dir <id> <guest-dir> <local-dir>
-download_dir() {
-  mkdir -p "$3"
-  fc_ssh "$1" "[ -d '$2' ] && tar -C '$2' -cf - . || true" | tar -C "$3" -xf - 2>/dev/null || true
-}
+# There is deliberately no download_dir: guest files reach the host only through
+# airlock_transfer (airlock.sh), never through a host-side tar of guest data.

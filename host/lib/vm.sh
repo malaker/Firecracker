@@ -13,18 +13,22 @@ validate_resources() {
     || die "requested ${mem} MiB but only ${avail_mib} MiB is free on the host (256 MiB is reserved for overhead)"
 }
 
-# vm_create <id> <slot> <vcpu> <mem-mib> <net-mode> <allow-csv> <lifetime-sec> <keep 0|1>
+# vm_create <id> <slot> <vcpu> <mem-mib> <net-mode> <allow-csv> <lifetime-sec> <keep 0|1> [role] [parent-id]
 # Starts the VM and waits for SSH. On failure the caller should vm_destroy.
+# role is "vm" (default) or "airlock"; an airlock records the run id it transfers files for.
 vm_create() {
   local id="$1" slot="$2" vcpu="$3" mem="$4" net="$5" allow="$6" lifetime="$7" keep="$8"
+  local role="${9:-vm}" parent="${10:-}"
   local uid=$(( FC_UID_BASE + slot )) jail root dir netjson="" pid
   jail="$(jail_dir "$id")"; root="$jail/root"; dir="$(vm_dir "$id")"
 
   jq -n --arg id "$id" --argjson slot "$slot" --argjson vcpu "$vcpu" \
     --argjson mem "$mem" --arg net "$net" --arg allow "$allow" --argjson lifetime "$lifetime" \
     --argjson keep "$keep" --arg started "$(now_iso)" --arg fc "${FC_VERSION:-}" \
+    --arg role "$role" --arg parent "$parent" \
     '{id:$id, state:"starting", slot:$slot, vcpu:$vcpu, mem_mib:$mem, net:$net, allow:$allow,
-      lifetime_sec:$lifetime, keep:($keep==1), started_at:$started, firecracker:$fc}' \
+      lifetime_sec:$lifetime, keep:($keep==1), started_at:$started, firecracker:$fc,
+      role:$role, parent:(if $parent == "" then null else $parent end)}' \
     > "$dir/meta.json"
 
   mkdir -p "$root"
@@ -73,6 +77,22 @@ vm_create() {
     net_configure_guest "$id" "$slot" </dev/null || return 1
   fi
   meta_set_str "$id" state running
+}
+
+# boot_vm_with <vcpu> <mem-mib> <net> <allow-csv> <lifetime-sec> <keep 0|1> <role> <parent-id>
+# Boots a VM with explicit settings; prints nothing, sets VM_ID. Exits via die on failure,
+# so callers that must survive a failed boot (the airlock) run it in a subshell.
+boot_vm_with() {
+  local vcpu="$1" mem="$2" net="$3" allow="$4" lifetime="$5" keep="$6" role="$7" parent="$8" slot
+  validate_resources "$vcpu" "$mem"
+  [ -c /dev/kvm ] || die "/dev/kvm is missing; run 'fc.ps1 doctor'"
+  VM_ID="$(new_run_id)"
+  slot="$(alloc_slot "$VM_ID")" || die "no free VM slots"
+  log "starting ${role/vm/VM} $VM_ID (net=$net vcpu=$vcpu mem=${mem}MiB lifetime=${lifetime}s${parent:+ for $parent})"
+  if ! vm_create "$VM_ID" "$slot" "$vcpu" "$mem" "$net" "$allow" "$lifetime" "$keep" "$role" "$parent"; then
+    vm_destroy "$VM_ID" 1
+    die "VM $VM_ID failed to start"
+  fi
 }
 
 # The watchdog is a detached process, so the VM is killed on time even if
