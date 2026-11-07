@@ -7,7 +7,7 @@ dir="$(cd "$(dirname "$0")" && pwd)"
 . "$dir/lib.sh"
 failed=()
 
-for t in boot resources lifecycle net run timeout; do
+for t in boot resources lifecycle net run airlock timeout; do
   bash "$dir/$t.sh"
   rc=$?
   if (( rc == 125 )); then

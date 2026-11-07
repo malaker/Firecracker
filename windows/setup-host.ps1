@@ -85,8 +85,13 @@ if ((Invoke-Root @('test', '-c', '/dev/kvm')) -ne 0) {
     Enable-NestedVirtualization
 }
 
-# 3. Packages, binaries, images, controller.
+# 3. Guest output airlock tool (needs the .NET 10 SDK; collecting run output depends on it).
+$airlockOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $RepoRoot 'airlock\install-airlock.ps1') -Rid linux-x64
+if ($LASTEXITCODE -ne 0) { throw "Building the guest output airlock tool failed (see the message above)." }
+$airlockWsl = ConvertTo-WslPath (@($airlockOut)[-1])
+
+# 4. Packages, binaries, images, controller.
 $repoWsl = ConvertTo-WslPath $RepoRoot
-if ((Invoke-Root @('bash', "$repoWsl/host/provision.sh", $repoWsl)) -ne 0) {
+if ((Invoke-Root @('bash', "$repoWsl/host/provision.sh", $repoWsl, $airlockWsl)) -ne 0) {
     throw "Provisioning failed (see output above)."
 }

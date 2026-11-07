@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Provision the fc-host WSL distro (run as root, idempotent).
-# Usage: provision.sh <repo-dir>
+# Usage: provision.sh <repo-dir> [airlock-build-dir]
+#   airlock-build-dir holds the linux-x64 fc-airlock published by airlock/install-airlock.ps1.
 set -euo pipefail
 
 REPO="$(cd "$1" && pwd)"
+AIRLOCK_BUILD="${2:-}"
 FC_HOME=/opt/fc-sandbox
 CACHE=/var/cache/fc-sandbox
 STATE=/var/lib/fc-sandbox
@@ -93,6 +95,15 @@ sync_file() {
 sync_file "$REPO/host/versions.env" "$FC_HOME/versions.env" 0644
 for f in "$REPO"/host/lib/*.sh; do sync_file "$f" "$FC_HOME/lib/$(basename "$f")" 0644; done
 for f in "$REPO"/host/bin/*; do sync_file "$f" "$FC_HOME/bin/$(basename "$f")" 0755; done
+# Guest output airlock tool (spec: kvm-host-setup / Airlock tooling for Linux guests).
+if [ -n "$AIRLOCK_BUILD" ]; then
+  [ -f "$AIRLOCK_BUILD/fc-airlock" ] || { say "error: $AIRLOCK_BUILD/fc-airlock not found"; exit 1; }
+  sync_file "$AIRLOCK_BUILD/fc-airlock" "$FC_HOME/bin/fc-airlock" 0755
+else
+  say "warning: no airlock build given; run 'fc.ps1 setup' to install fc-airlock"
+fi
+mkdir -p "$STATE/staging"
+chmod 0711 "$STATE/staging"
 
 # --- host settings ----------------------------------------------------------
 if [ ! -f /etc/sysctl.d/90-fc-sandbox.conf ]; then
