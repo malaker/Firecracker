@@ -17,8 +17,9 @@ fc_ssh() {
 
 # Wait until SSH answers in the guest; returns non-zero after $2 seconds.
 wait_ssh() {
-  local id="$1" limit="${2:-60}" start=$SECONDS
-  while (( SECONDS - start < limit )); do
+  local id="$1" limit="${2:-60}" start
+  start=$(mono_ms)
+  while (( $(mono_ms) - start < limit * 1000 )); do
     vm_alive "$id" || return 1
     if [ -S "$(vsock_path "$id")" ] && fc_ssh "$id" true </dev/null 2>/dev/null; then
       return 0

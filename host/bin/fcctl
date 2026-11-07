@@ -112,15 +112,16 @@ cmd_run() {
   else
     fc_ssh "$VM_ID" "mkdir -p /work/out" </dev/null || true
     log "running: $OPT_CMD"
-    t0=$SECONDS
+    t0=$(mono_ms)
     set +e
     timeout -k 10 "$OPT_TIMEOUT" \
       bash -c 'fc_ssh "$@"' _ "$VM_ID" "cd /work && $OPT_CMD" </dev/null \
       > >(tee "$out/stdout.log") 2> >(tee "$out/stderr.log" >&2)
     rc=$?
     set -e
-    elapsed=$(( SECONDS - t0 ))
-    if (( rc == 124 || rc == 137 )) && (( elapsed >= OPT_TIMEOUT )); then
+    elapsed=$(( $(mono_ms) - t0 ))
+    # Monotonic: a wall-clock adjustment must not turn a real timeout into a plain exit 124.
+    if (( rc == 124 || rc == 137 )) && (( elapsed >= OPT_TIMEOUT * 1000 - 100 )); then
       rc=$EXIT_TIMEOUT timed_out=true
       log "timed out after ${OPT_TIMEOUT}s"
     elif (( rc == 255 )) && ! vm_alive "$VM_ID"; then

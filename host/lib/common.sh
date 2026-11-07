@@ -35,6 +35,14 @@ require_root() { [ "$(id -u)" -eq 0 ] || die "must run as root (the fc.ps1 wrapp
 
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
+# Monotonic milliseconds (since boot). Use this, not $SECONDS or date, to measure durations:
+# WSL adjusts its wall clock, which can make a 20 s wait look like 18 s.
+mono_ms() {
+  local up
+  read -r up _ < /proc/uptime
+  echo $(( ${up%.*} * 1000 + 10#${up#*.} * 10 ))
+}
+
 # Parse 90, 90s, 30m, 1h into seconds.
 parse_duration() {
   local v="$1"
