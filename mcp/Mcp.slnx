@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="FcMcp/FcMcp.csproj" />
+  <Project Path="FcMcp.Tests/FcMcp.Tests.csproj" />
+</Solution>

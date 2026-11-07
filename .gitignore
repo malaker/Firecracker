@@ -22,3 +22,7 @@ windows/egress/**/obj/
 # .NET build output (airlock)
 airlock/**/bin/
 airlock/**/obj/
+
+# .NET build output (mcp)
+mcp/**/bin/
+mcp/**/obj/

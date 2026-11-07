@@ -22,7 +22,9 @@ param(
     [string]$Timeout = '30m',
     [switch]$Keep,
     [switch]$Boot,
-    [string]$ResultsDir
+    [string]$ResultsDir,
+    # run: write {"run_id","results_dir"} here as soon as the VM has an id (used by the MCP server).
+    [string]$RunInfoFile
 )
 
 $ErrorActionPreference = 'Stop'
@@ -235,6 +237,15 @@ switch ($Command) {
         $runId       = Start-NewFcWinVm ($timeoutSec + $script:COLLECT_GRACE_SEC)
         $outRunDir   = Join-Path $ResultsDir $runId
         New-Item -ItemType Directory -Force -Path (Join-Path $outRunDir 'out') | Out-Null
+        if ($RunInfoFile) {
+            try {
+                $info = [ordered]@{ run_id = $runId; results_dir = $outRunDir } | ConvertTo-Json -Compress
+                [System.IO.File]::WriteAllText("$RunInfoFile.tmp", $info)
+                Move-Item -LiteralPath "$RunInfoFile.tmp" -Destination $RunInfoFile -Force
+            } catch {
+                Write-FcLog "warning: could not write the run info file ${RunInfoFile}: $($_.Exception.Message)"
+            }
+        }
 
         Write-FcWinRunResultMeta -ResultsDir $outRunDir -RunId $runId -CommandText $Cmd -PayloadPath $payloadFull
         Set-FcWinVmMetaProperty -RunId $runId -Key 'results_dir' -Value $outRunDir

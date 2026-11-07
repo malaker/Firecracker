@@ -14,12 +14,18 @@ Usage: fcctl <command> [options]
 
 Commands:
   doctor [--boot]            Check that this host can run microVMs (--boot also boots a test VM)
-  run --payload DIR --cmd CMD [vm options] [--results-dir DIR]
+  run --payload DIR --cmd CMD [vm options] [--results-dir DIR] [--run-info-file FILE]
                              Boot a VM, upload DIR to /work/in, run CMD in /work,
                              collect /work/out and logs into <results-dir>/<run-id>/, destroy the VM
   shell [vm options]         Boot a VM and open an interactive root shell; destroyed on exit
   start [vm options]         Boot a VM in the background and print its run id
   ssh <run-id> [command]     Open a shell or run a command in a started VM
+  put <run-id> <host-path> [guest-dir]
+                             Copy a host file, or a folder's contents, into a started VM
+                             (default guest-dir /work/in)
+  get <run-id> <guest-path> <local-dir>
+                             Copy a guest file or folder out of a started VM through the
+                             airlock into an empty or new local-dir (exit 1 if refused)
   list                       List VMs (running, dead or kept)
   stop <run-id>              Destroy a VM (a kept VM's disk is removed too)
   cleanup                    Destroy every VM and remove all leftovers from earlier runs
@@ -39,7 +45,7 @@ EOF
 # --- option parsing ---------------------------------------------------------
 OPT_NET=isolated OPT_ALLOW="" OPT_VCPU=$DEFAULT_VCPU OPT_MEM=$DEFAULT_MEM_MIB
 OPT_TIMEOUT=$DEFAULT_TIMEOUT OPT_KEEP=0 OPT_PAYLOAD="" OPT_CMD="" OPT_RESULTS="$FC_RESULTS_DEFAULT"
-OPT_BOOT=0 POSITIONAL=()
+OPT_BOOT=0 OPT_RUN_INFO="" POSITIONAL=()
 
 parse_opts() {
   while (( $# )); do
@@ -53,6 +59,7 @@ parse_opts() {
       --payload)     OPT_PAYLOAD="$2"; shift ;;
       --cmd)         OPT_CMD="$2"; shift ;;
       --results-dir) OPT_RESULTS="$2"; shift ;;
+      --run-info-file) OPT_RUN_INFO="$2"; shift ;;
       --boot)        OPT_BOOT=1 ;;
       -h|--help)     usage; exit 0 ;;
       --*)           die "unknown option '$1'" ;;
@@ -98,6 +105,7 @@ cmd_run() {
   # this controller dies before the run ends.
   write_run_meta "$out" "$started" null false ""
   meta_set_str "$VM_ID" results_dir "$out"
+  [ -z "$OPT_RUN_INFO" ] || write_run_info "$OPT_RUN_INFO" "$out"
 
   if ! upload_dir "$VM_ID" "$OPT_PAYLOAD" /work/in; then
     rc=$EXIT_INFRA error="payload upload failed"
@@ -144,6 +152,15 @@ collection_json() {
     '{status:$s, reason:(if $r == "" then null else $r end), files:$f, bytes:$b}'
 }
 
+# write_run_info <file> <results-dir>: tells a caller (the MCP server) which run this is,
+# as soon as the VM has an id. results_dir is given as a Windows path.
+write_run_info() {
+  local win
+  win="$(wslpath -w "$2" 2>/dev/null || echo "$2")"
+  jq -n --arg id "$VM_ID" --arg dir "$win" '{run_id:$id, results_dir:$dir}' > "$1.tmp" && mv "$1.tmp" "$1" \
+    || log "warning: could not write the run info file $1"
+}
+
 # write_run_meta <dir> <started> <exit-code|null> <timed-out> <error> [collection-json]
 # An exit code of null means the run is still in progress (no ended_at).
 write_run_meta() {
@@ -185,6 +202,47 @@ cmd_ssh() {
   else
     fc_ssh "$id" -t
   fi
+}
+
+# A started VM that put/get may use: running, and not an airlock.
+require_session_vm() {
+  local id="$1"
+  [ -n "$id" ] && vm_exists "$id" && vm_alive "$id" || die "no running VM '$id'"
+  [ "$(meta_get "$id" role)" != airlock ] || die "VM '$id' is an airlock"
+}
+
+# put <run-id> <host-path> [guest-dir]: copies a host file, or a folder's contents, into the
+# guest (default /work/in). Host data is trusted, so the guest unpacks it with its own tar.
+cmd_put() {
+  local id="${POSITIONAL[0]:-}" src="${POSITIONAL[1]:-}" gdir="${POSITIONAL[2]:-/work/in}" qdir
+  require_session_vm "$id"
+  [ -n "$src" ] && [ -e "$src" ] || die "host path '$src' not found"
+  printf -v qdir '%q' "$gdir"
+  if [ -d "$src" ]; then
+    tar -C "$src" -cf - . | fc_ssh "$id" "mkdir -p $qdir && tar -C $qdir --no-same-owner -xf -" \
+      || die "copy into $gdir failed"
+  else
+    tar -C "$(dirname -- "$src")" -cf - -- "$(basename -- "$src")" \
+      | fc_ssh "$id" "mkdir -p $qdir && tar -C $qdir --no-same-owner -xf -" || die "copy into $gdir failed"
+  fi
+  log "copied $src into $gdir"
+}
+
+# get <run-id> <guest-path> <local-dir>: copies a guest file or folder out through the airlock.
+# local-dir must not exist or be empty. Exit 1 when the airlock refuses the files.
+cmd_get() {
+  local id="${POSITIONAL[0]:-}" gpath="${POSITIONAL[1]:-}" dest="${POSITIONAL[2]:-}"
+  require_session_vm "$id"
+  [ -n "$gpath" ] || die "get needs a guest path"
+  [ -n "$dest" ] || die "get needs a local destination folder"
+  if airlock_transfer "$id" "$gpath" "$dest" "" error; then
+    log "copied $AIRLOCK_FILES files ($AIRLOCK_BYTES bytes) from $gpath to $dest"
+    return 0
+  fi
+  case "$AIRLOCK_STATUS" in
+    refused) exit 1 ;;
+    *) case "$AIRLOCK_REASON" in "guest path"*) exit 1 ;; *) exit "$EXIT_INFRA" ;; esac ;;
+  esac
 }
 
 cmd_list() {
@@ -277,6 +335,8 @@ main() {
     shell)   cmd_shell ;;
     start)   cmd_start ;;
     ssh)     cmd_ssh ;;
+    put)     cmd_put ;;
+    get)     cmd_get ;;
     list)    cmd_list ;;
     stop)    cmd_stop ;;
     cleanup) cmd_cleanup ;;
