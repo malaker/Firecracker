@@ -26,3 +26,7 @@ airlock/**/obj/
 # .NET build output (mcp)
 mcp/**/bin/
 mcp/**/obj/
+
+# .NET build output (windows/common)
+windows/common/**/bin/
+windows/common/**/obj/

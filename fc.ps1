@@ -137,11 +137,20 @@ if ($Guest -eq 'windows') {
         exit $LASTEXITCODE
     }
 
-    if ($Command -in @('put', 'get')) {
-        [Console]::Error.WriteLine("[fc] ERROR: '$Command' is not available for Windows guests yet.")
-        exit 125
-    }
     $winParams = $commonWin.Clone()
+    if ($Command -in @('put', 'get')) {
+        if (-not $Rest -or $Rest.Count -ne 2) {
+            $what = if ($Command -eq 'put') { 'host-path' } else { 'guest-path' }
+            [Console]::Error.WriteLine("[fc] ERROR: usage: fc.ps1 $Command <run-id> <$what> -Guest windows [-Dest <folder>]")
+            exit 125
+        }
+        if ($Command -eq 'get') {
+            $hostDest = if ($Dest) { $Dest } else { Join-Path $PSScriptRoot "runs\$($Rest[0])\files" }
+            $winParams.Dest = if ([System.IO.Path]::IsPathRooted($hostDest)) { $hostDest } else { Join-Path (Get-Location).ProviderPath $hostDest }
+        } elseif ($Dest) {
+            $winParams.Dest = $Dest
+        }
+    }
     $winParams.Command = $Command
     if ($Rest)    { $winParams.Rest    = $Rest }
     if ($Payload) { $winParams.Payload = $Payload }

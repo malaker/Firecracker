@@ -27,6 +27,10 @@ flowchart LR
     lvm -. "tap + NAT<br/>(networked only)" .-> internet(("Internet"))
     wvm -. "proxy frames over exec<br/>(networked only)" .-> egress
     egress -. "policy-checked TCP" .-> internet
+    lvm -. "out/ as opaque bytes" .-> lair["airlock microVM<br/>fc-airlock validate"]
+    wvm -. "out\ as opaque bytes" .-> wair["airlock Utility VM<br/>fc-airlock validate"]
+    lair -- "checked manifest + blob<br/>(unpacked unprivileged)" --> fcctl
+    wair -- "checked manifest + blob<br/>(unpacked unprivileged)" --> fcwin
     fcctl --> runs
     fcwin --> runs
 ```
@@ -39,13 +43,14 @@ flowchart LR
 - **Hard timeouts.** A detached watchdog enforces every VM's lifetime, even if the controller crashes.
 - **Two network modes.** `isolated` has no network device at all. `networked` has controlled egress with the host and private ranges blocked, plus an optional destination allowlist: NAT-ed through nftables for Linux guests, and through a host-side egress proxy for Windows guests, which still have no network adapter.
 - **Simple results.** Each run's exit code, stdout/stderr, metadata and output files are collected into `runs\<run-id>\` on Windows.
+- **Guest output airlock.** Output files never reach the host by unpacking a guest's archive: a fresh airlock VM validates and re-encodes them, and the host checks the result again without admin rights before writing anything. Links, devices, unsafe names and oversized output are refused. See [Guest output airlock](#guest-output-airlock).
 
 ## Requirements
 
 - Windows 11 with a CPU that has hardware virtualization (Intel VT-x or AMD-V) enabled in firmware
 - **For `-Guest linux` (default):** WSL 2 (a recent version that supports `wsl --install <distro> --name`) and WSL2 nested virtualization (on by default on Windows 11; setup offers to enable it if needed)
 - **For `-Guest windows`:** An elevated (Administrator) PowerShell prompt, plus the Windows `Microsoft-Hyper-V` and `Containers` optional features (setup offers to enable them if needed)
-- **The [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)**, used by setup to build the guest output airlock tool (`fc-airlock`) and the MCP server (`fc-mcp.exe`). Linux setup fails without it, because run output is collected through the airlock. For `-Guest windows -Net networked` it also builds the egress proxy (`fc-egress.exe`) and the guest relay (`fc-relay.exe`).
+- **The [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)** (**breaking change:** earlier versions needed it only for Windows networked mode), used by setup to build the guest output airlock tool (`fc-airlock`) and the MCP server (`fc-mcp.exe`). Linux and Windows setup both fail without it, because run output is collected through the airlock. For `-Guest windows -Net networked` it also builds the egress proxy (`fc-egress.exe`) and the guest relay (`fc-relay.exe`).
 - About 6 GB of free disk space and internet access during setup
 
 Tested with Windows 11 build 26200, WSL 2.6.3 (kernel 6.6.87), Firecracker v1.17.0, and Nano Server 2025 (`ltsc2025`).
@@ -180,10 +185,10 @@ Remove-Item -Recurse -Force C:\ProgramData\containerd
 | `.\fc.ps1 shell [options]` | Boot a VM and open an interactive root / `ContainerAdministrator` shell; the VM is destroyed on exit |
 | `.\fc.ps1 start [options]` | Boot a VM in the background and print its run id |
 | `.\fc.ps1 ssh <run-id> ['<command>']` | Open a shell in, or run a command in, a started VM |
-| `.\fc.ps1 put <run-id> <host-path> [-Dest <guest-dir>]` | Copy a host file, or a folder's contents, into a started VM (default `/work/in`). Linux guests for now |
-| `.\fc.ps1 get <run-id> <guest-path> [-Dest <host-dir>]` | Copy a guest file or folder out of a started VM through the [guest output airlock](#mcp-server-fcps1-mcp) into an empty or new folder (default `runs\<run-id>\files\`). Exits `1` when the airlock refuses the files (links, devices, unsafe names, over the limits) and writes nothing. Linux guests for now |
+| `.\fc.ps1 put <run-id> <host-path> [-Dest <guest-dir>]` | Copy a host file, or a folder's contents, into a started VM (default `/work/in`, or `C:\work\in` on Windows) |
+| `.\fc.ps1 get <run-id> <guest-path> [-Dest <host-dir>]` | Copy a guest file or folder out of a started VM through the [guest output airlock](#guest-output-airlock) into an empty or new folder (default `runs\<run-id>\files\`). Exits `1` when the airlock refuses the files (links, devices, unsafe names, over the limits) or the guest path does not exist, and writes nothing |
 | `.\fc.ps1 mcp [-AllowRoot <dir>[,...]] [-AllowNetworked] [-MaxSessions <n>]` | Run the [MCP server](#mcp-server-fcps1-mcp) over stdio, for an MCP client to launch |
-| `.\fc.ps1 list` | List VMs: `running`, `dead` (process gone, e.g. after a WSL/service restart) or `kept` |
+| `.\fc.ps1 list` | List VMs: `running`, `dead` (process gone, e.g. after a WSL/service restart) or `kept`. `ROLE` is `vm`, or `airlock:<run-id>` for an airlock collecting that run's output |
 | `.\fc.ps1 stop <run-id>` | Destroy a VM (process, jail/Utility VM, disk copy/container, tap device and firewall rules on Linux, egress proxy on Windows) |
 | `.\fc.ps1 cleanup` | Destroy every VM and remove all leftovers, including kept disks and orphans from crashes. Without `-Guest` it covers both backends. Windows VMs can only be destroyed from an elevated prompt; without elevation their state is left untouched and the command fails |
 | `.\fc.ps1 doctor [-Boot]` | Run preflight checks |
@@ -333,17 +338,19 @@ Any other stdio MCP client takes the same command, for example:
 - **Cleanup:** sessions keep the normal hard timeout (default 30 minutes). When the client disconnects or the server is stopped (Ctrl+C, console closed), the server destroys all its sessions. If the server process is killed outright, the VMs' watchdogs still destroy them at their timeout; `fc.ps1 cleanup` removes them earlier.
 - **Bounded, marked output:** each returned stdout/stderr is at most 64 KiB (beginning and end, with a `[... N bytes omitted ...]` marker); the full logs stay in `runs\`. Guest output is stripped of terminal escape sequences and control characters, follows a fixed notice that it is untrusted data, and sits between delimiters that carry a random value per call, so guest output cannot fake the end of its own block.
 - **No host-side actions:** the server has no tool that runs a host command, reads host files other than uploads from the allowed roots, or writes outside `runs\`.
-- **Windows guests** need the MCP server to run elevated, which means starting the MCP client from an elevated prompt. Otherwise Windows-guest calls are refused. Windows-guest `put`/`get` are not available yet.
+- **Windows guests** need the MCP server to run elevated, which means starting the MCP client from an elevated prompt. Otherwise Windows-guest calls are refused.
 
 **Recommended client settings:** guest output is attacker-controlled. Keep the client's own permission prompts on for shell and file-writing tools while working with untrusted samples, and do not let the agent auto-approve host commands suggested by sandbox output.
 
 ### Guest output airlock
 
-Files never reach the host by unpacking a guest's archive on the host. Every copy out of a guest (`run`'s `out\` and `get`) goes through a fresh airlock VM of the same guest OS (Linux guests today):
+Files never reach the host by unpacking a guest's archive on the host. Every copy out of a guest (`run`'s `out\` and `get`) goes through a fresh airlock VM of the same guest OS: a Firecracker microVM for Linux guests, a Hyper-V isolated Nano Server VM for Windows guests.
 
-1. The host copies the guest's tar stream as opaque bytes, capped in size.
-2. A new isolated airlock VM (1 vCPU, 256 MiB, 5-minute lifetime) reads the stream as an unprivileged user with `fc-airlock validate`. It accepts only regular files and directories with names that are safe on NTFS (no `..`, absolute paths, `:`, reserved device names such as `con.txt`, trailing dots or spaces, or names that differ only in case), within 1 GiB, 10,000 entries and 1 GiB per file, and re-encodes them as a blob plus a manifest with SHA-256 hashes. The airlock is then destroyed.
-3. On the host, `fc-airlock unpack` runs as a throwaway unprivileged user, checks every rule, byte range and hash again, and writes into an empty staging folder. Only directories and regular files are moved into place, all at once or not at all.
+1. The host copies the guest's tar stream as opaque bytes, capped in size while it streams.
+2. A new isolated airlock VM (1 vCPU, 256 MiB, 5-minute lifetime) reads the stream as an unprivileged user (`nobody` on Linux, `ContainerUser` on Windows) with `fc-airlock validate`. It accepts only regular files and directories with names that are safe on NTFS (no `..`, absolute paths, `:`, reserved device names such as `con.txt`, trailing dots or spaces, or names that differ only in case), within 1 GiB, 10,000 entries and 1 GiB per file, and re-encodes them as a blob plus a manifest with SHA-256 hashes. The airlock is then destroyed.
+3. On the host, `fc-airlock unpack` checks every rule, byte range and hash again and writes into an empty staging folder, without admin or root rights: as a throwaway uid inside `fc-host` for Linux guests, and through `fc-airlock launch-unpack` (a non-admin, Medium-integrity token in a kill-on-close job) for Windows guests, whose controller runs elevated. Only directories and regular files are moved into place, all at once or not at all.
+
+Windows guests: `tar.exe` follows junctions and directory links instead of archiving them, so links in a Windows guest's output are found and refused before the copy starts (`junction or symbolic link is not allowed: './<name>'`).
 
 A refused collection keeps the guest command's exit code, leaves `out\` empty, prints `collection refused: <reason>`, and is recorded in `meta.json` under `collection` (`status` `ok`, `refused` or `failed`, with `reason`, `files` and `bytes`). Runs with no output start no airlock. While a collection runs, `list` shows the airlock with role `airlock:<run-id>`.
 
@@ -352,7 +359,7 @@ A refused collection keeps the guest command's exit code, leaves `out\` empty, p
 - **MCP server and prompt injection:** a sample's output reaches the host agent through the MCP tools. The server bounds and marks that output and offers no host-side tools, but a marker does not stop a model from following instructions in it; the client's permission settings remain the final control.
 - **Elevated MCP clients:** using Windows guests through MCP means running the MCP client elevated, so everything that client does runs with administrator rights. Use a separate elevated client session only for Windows-guest work.
 - **Killed MCP server:** if the server process is killed instead of stopped, its sessions keep running until their hard timeout (default 30 minutes; use a shorter `timeout` for agent sessions) or until `fc.ps1 cleanup`.
-
+- **Guest output airlock:** the only host code that reads data derived from guest output is `fc-airlock unpack`. It parses a small manifest (JSON) and copies byte ranges, in a memory-safe language, without admin or root rights, after the riskier archive parsing already ran inside a throwaway airlock VM. An attacker would need to compromise the airlock and then this reader. Each collection with output costs one more VM boot (about 1.5-8 s for Linux, about 3.5-5 s for Windows). The Windows link check before the copy relies on the guest's answer; a guest that hides a link only gets its own files collected, within the limits.
 - **Linux (Firecracker + jailer):** Firecracker with the jailer provides strong isolation but is not a guarantee against KVM or Firecracker escape vulnerabilities. A successful escape would land in the `fc-host` WSL VM, which can access Windows drives through `/mnt/c`. For high-risk samples, set `[automount] enabled=false` in `fc-host`'s `/etc/wsl.conf`. Results then stay in `/var/lib/fc-sandbox/results` inside the distro, and `fc.ps1` (which runs scripts from `/mnt/c`) is unavailable until automount is re-enabled.
 - **Windows (Hyper-V Utility VM):** Every Windows guest runs with `--isolation=hyperv` inside a dedicated Hyper-V Utility VM (`vmwp.exe`) with its own Windows kernel, and files are streamed in and out via `tar.exe` over `HVSocket` rather than mounting a writable host directory. It does not defend against Hyper-V (`vmwp.exe` / VMBus) escape vulnerabilities. Compared with the Linux path there is one layer fewer (no surrounding WSL VM), and the host components that carry guest exec traffic (`vmcompute.exe`, `dockerd.exe`) run as `SYSTEM`.
 - **Windows networked mode is enforced by the egress proxy, not by Windows networking.** Windows 11 accepts HNS endpoint ACLs on NAT networks but doesn't enforce them, and Windows Firewall rules don't reliably filter traffic forwarded from containers. An earlier HNS-based design let guests reach the LAN and host services. The proxy is the only new host code that reads guest data: it parses fixed-size binary frames (no HTTP), limits frame size, stream count and idle time, and runs without admin rights. It sees only TCP connection requests, not traffic inside TLS.

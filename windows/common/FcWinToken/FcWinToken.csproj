@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Windows restricted launch shared by fc-egress (proxy 'serve') and fc-airlock ('launch-unpack'):
+       a non-admin, Medium-integrity token, an explicit inherited-handle list, and a limiting job.
+       Targets plain net10.0 (Windows-only at run time) so fc-airlock can still publish for linux-x64. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsTrimmable>true</IsTrimmable>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <RootNamespace>FcWin</RootNamespace>
+  </PropertyGroup>
+
+</Project>

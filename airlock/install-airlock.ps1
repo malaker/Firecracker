@@ -46,15 +46,25 @@ function Test-Elevated {
 # Ancestors under ProgramData get their owner reset too, so a folder pre-created by a
 # non-admin cannot be used to swap the binary later.
 function Protect-AirlockDir([string]$Dir) {
-    $base = Split-Path -Parent (Split-Path -Parent $Dir)
-    foreach ($d in @($base, (Split-Path -Parent $Dir))) {
-        $r = & icacls.exe $d /setowner '*S-1-5-32-544' /C /Q 2>&1
-        if ($LASTEXITCODE -ne 0) { throw "Cannot set the owner of '$d': $r" }
+    # icacls reports per-file problems on stderr; Windows PowerShell 5.1 would turn that into a
+    # terminating error under 'Stop', so only its exit code decides here.
+    $ErrorActionPreference = 'Continue'
+    function Invoke-Icacls([string]$What, [string[]]$IcaclsArgs) {
+        $r = & icacls.exe @IcaclsArgs 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "Cannot $What`: $(($r | Out-String).Trim())" }
     }
-    $r = & icacls.exe $Dir /setowner '*S-1-5-32-544' /T /C /Q 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "Cannot set the owner of '$Dir': $r" }
-    $r = & icacls.exe $Dir /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' /T /C /Q 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "Cannot restrict '$Dir': $r" }
+    $base = Split-Path -Parent (Split-Path -Parent $Dir)
+    foreach ($d in @($base, (Split-Path -Parent $Dir), $Dir)) {
+        Invoke-Icacls "set the owner of '$d'" @($d, '/setowner', '*S-1-5-32-544', '/C', '/Q')
+    }
+    # Protect the folder itself; its contents then inherit only these entries. (Applying the
+    # folder grants with /T would leave files without any access entry: (OI)(CI) is folder-only.)
+    Invoke-Icacls "restrict '$Dir'" @($Dir, '/inheritance:r', '/grant:r', '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-545:(OI)(CI)RX', '/C', '/Q')
+    if (Get-ChildItem -LiteralPath $Dir -Force | Select-Object -First 1) {
+        # Reset first (it needs no access to the file's own ACL as owner), then take ownership.
+        Invoke-Icacls "reset permissions under '$Dir'" @((Join-Path $Dir '*'), '/reset', '/T', '/C', '/Q')
+        Invoke-Icacls "set the owner of files under '$Dir'" @((Join-Path $Dir '*'), '/setowner', '*S-1-5-32-544', '/T', '/C', '/Q')
+    }
 }
 
 $outDir = Get-AirlockOutDir
@@ -66,13 +76,16 @@ if ($Rid -eq 'win-x64' -and -not (Test-Elevated)) {
     exit 2
 }
 
-$sources = @(Get-ChildItem -LiteralPath $SourceDir -Recurse -File -Include *.cs, *.csproj |
+# fc-airlock also compiles the shared restricted-launch code in windows\common.
+$commonDir = Join-Path (Split-Path -Parent $SourceDir) 'windows\common'
+$sources = @(Get-ChildItem -LiteralPath @($SourceDir, $commonDir) -Recurse -File -Include *.cs, *.csproj -ErrorAction SilentlyContinue |
     Where-Object { $_.FullName -notmatch '\\(bin|obj|FcAirlock\.Tests)\\' })
 $newestSource = ($sources | Measure-Object -Property LastWriteTimeUtc -Maximum).Maximum
 
 try {
+    # Repair the folder's permissions first, so a damaged ACL cannot block the checks below.
+    if ($Rid -eq 'win-x64' -and (Test-Path -LiteralPath $outDir)) { Protect-AirlockDir $outDir }
     if ((Test-Path -LiteralPath $exe) -and (Get-Item -LiteralPath $exe).LastWriteTimeUtc -ge $newestSource) {
-        if ($Rid -eq 'win-x64') { Protect-AirlockDir $outDir }
         Write-AirlockLog "fc-airlock ($Rid) is up to date."
         Write-Output $outDir
         exit 0

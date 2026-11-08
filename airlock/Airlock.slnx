@@ -2,4 +2,5 @@
   <Project Path="FcAirlock.Core/FcAirlock.Core.csproj" />
   <Project Path="FcAirlock.Tests/FcAirlock.Tests.csproj" />
   <Project Path="FcAirlock/FcAirlock.csproj" />
+  <Project Path="../windows/common/FcWinToken/FcWinToken.csproj" />
 </Solution>

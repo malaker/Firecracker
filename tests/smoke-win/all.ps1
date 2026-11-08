@@ -22,7 +22,7 @@ $cfgBackup = if (Test-Path -LiteralPath $cfgPath) { [System.IO.File]::ReadAllByt
 
 Write-Host "=== Windows microVM smoke tests (runtime=$WinRuntime) ==="
 try {
-    Write-Host "=== [1/5] Windows setup & doctor (-Boot) ==="
+    Write-Host "=== [1/6] Windows setup & doctor (-Boot) ==="
     [void](Invoke-FcSmokeLimitationSkip 'build-from-source' $WinRuntime $FcPs1 'local image build')
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $FcPs1 setup -Guest windows -WinRuntime $WinRuntime -ImageRepo malaker/nanoserver -Flavour aspnet-x86 -Yes
     if ($LASTEXITCODE -ne 0) { throw "setup -Guest windows failed" }
@@ -30,19 +30,25 @@ try {
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $FcPs1 doctor -Guest windows -WinRuntime $WinRuntime -Boot
     if ($LASTEXITCODE -ne 0) { throw "doctor -Guest windows -Boot failed" }
 
-    Write-Host "=== [2/5] Isolated payload run & exit code propagation ==="
+    Write-Host "=== [2/6] Isolated payload run & exit code propagation ==="
     & (Join-Path $PSScriptRoot 'net-isolated.ps1') -WinRuntime $WinRuntime
 
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $FcPs1 run -Guest windows -WinRuntime $WinRuntime -Payload (Join-Path $RepoRoot 'samples\hello-win') -Cmd 'exit /b 3'
     if ($LASTEXITCODE -ne 3) { throw "Expected exit code 3 from guest command, got $LASTEXITCODE" }
 
-    Write-Host "=== [3/5] Lifecycle, ssh, keep, timeout watchdog, stop & cleanup ==="
+    Write-Host "=== [3/6] Lifecycle, ssh, keep, timeout watchdog, stop & cleanup ==="
     & (Join-Path $PSScriptRoot 'lifecycle.ps1') -WinRuntime $WinRuntime
 
-    Write-Host "=== [4/5] Networked mode (egress proxy), host/LAN protection & CIDR allowlist ==="
+    Write-Host "=== [4/6] Guest output airlock (links, reserved names, limits) and put/get ==="
+    & (Join-Path $PSScriptRoot 'airlock.ps1') -WinRuntime $WinRuntime
+    if ($LASTEXITCODE -ne 0) { throw "airlock smoke test failed" }
+    & (Join-Path $PSScriptRoot 'files.ps1') -WinRuntime $WinRuntime
+    if ($LASTEXITCODE -ne 0) { throw "put/get smoke test failed" }
+
+    Write-Host "=== [5/6] Networked mode (egress proxy), host/LAN protection & CIDR allowlist ==="
     & (Join-Path $PSScriptRoot 'net-protect.ps1') -WinRuntime $WinRuntime
 
-    Write-Host "=== [5/5] Final cleanup & empty list check ==="
+    Write-Host "=== [6/6] Final cleanup & empty list check ==="
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $FcPs1 cleanup -Guest windows -WinRuntime $WinRuntime
     $remaining = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $FcPs1 list -Guest windows -WinRuntime $WinRuntime) | Where-Object { $_ -notmatch '^RUN-ID' -and $_.Trim() -ne '' }
     if ($remaining) {

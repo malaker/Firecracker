@@ -6,6 +6,7 @@ $FcPs1    = Join-Path $RepoRoot 'fc.ps1'
 
 . (Join-Path $RepoRoot 'windows\lib\common.ps1')
 . (Join-Path $RepoRoot 'windows\lib\runtime.ps1')
+. (Join-Path $PSScriptRoot 'smoke-lib.ps1')
 
 Write-Host "[smoke-win:lifecycle] 1. Start two Windows microVMs (aspnet-x86 and iis-netfx-x86)..."
 $id1 = "$(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $FcPs1 start -Guest windows -WinRuntime $WinRuntime -Flavour aspnet-x86 -Vcpu 2 -MemMib 1024)".Trim()
@@ -42,12 +43,12 @@ if ($listAfterStop -match [regex]::Escape($id1)) {
 $timeoutNet = if (Test-FcWinFeatureSupported 'networked' $WinRuntime) { 'networked' } else { 'isolated' }
 Write-Host "[smoke-win:lifecycle] 4. Verify hard timeout (3s, $timeoutNet) records timed_out=true and exit_code=124..."
 $sampleDir = Join-Path $RepoRoot 'samples\hello-win'
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $FcPs1 run -Guest windows -WinRuntime $WinRuntime -Net $timeoutNet -Payload $sampleDir -Cmd 'ping -n 15 127.0.0.1 >nul' -Timeout 3s
-$rcTimeout = $LASTEXITCODE
+$timeoutRun = Invoke-FcSmokeRun $FcPs1 @('-Guest', 'windows', '-WinRuntime', $WinRuntime, '-Net', $timeoutNet, '-Payload', $sampleDir, '-Cmd', 'ping -n 15 127.0.0.1 >nul', '-Timeout', '3s')
+$rcTimeout = $timeoutRun.ExitCode
 if ($rcTimeout -ne 124) {
     throw "Expected exit code 124 on timeout, got $rcTimeout"
 }
-$latestRun = Get-ChildItem -LiteralPath (Join-Path $RepoRoot 'runs') -Directory | Sort-Object Name | Select-Object -Last 1
+$latestRun = Get-Item -LiteralPath $timeoutRun.ResultsDir
 $meta = Get-Content -LiteralPath (Join-Path $latestRun.FullName 'meta.json') -Raw | ConvertFrom-Json
 if (-not $meta.timed_out -or $meta.exit_code -ne 124 -or $meta.guest -ne 'windows') {
     throw "Timeout run meta.json did not record timed_out=true and exit_code=124: $($meta | ConvertTo-Json -Compress)"

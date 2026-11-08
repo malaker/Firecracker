@@ -61,7 +61,8 @@ try {
     $start = Call-Tool 'sandbox_start' @{ guest = $Guest; vcpu = 1; mem_mib = 256; timeout = '10m' }
     $sid = $start.structuredContent.session_id
     Expect "sandbox_start returns a session id" ($sid -match '^\d{8}-\d{6}-[0-9a-f]{4}$')
-    $mk = if ($Guest -eq 'linux') { 'mkdir -p out && echo e2e > out/e2e.txt' } else { 'mkdir out 2>nul & echo e2e> out\e2e.txt' }
+    # Windows VMs start with C:\work\out already there (a failing mkdir would leave errorlevel 1).
+    $mk = if ($Guest -eq 'linux') { 'mkdir -p out && echo e2e > out/e2e.txt' } else { 'echo e2e> out\e2e.txt' }
     $exec = Call-Tool 'sandbox_exec' @{ session_id = $sid; command = $mk }
     Expect "sandbox_exec succeeds" ($exec.structuredContent.exit_code -eq 0)
     $outPath = if ($Guest -eq 'linux') { '/work/out' } else { 'C:\work\out' }
