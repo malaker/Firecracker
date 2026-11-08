@@ -1,9 +1,10 @@
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 
-namespace FcEgress;
+namespace FcWin;
 
-internal static partial class Native
+[System.Runtime.Versioning.SupportedOSPlatform("windows")]
+public static partial class Native
 {
     public const uint HANDLE_FLAG_INHERIT = 1;
     public const int STARTF_USESTDHANDLES = 0x100;
@@ -19,6 +20,9 @@ internal static partial class Native
     public const uint JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x8;
     public const uint JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x100;
     public const uint JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION = 0x400;
+    public const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000;
+    public const uint WAIT_OBJECT_0 = 0;
+    public const uint WAIT_TIMEOUT = 0x102;
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     public struct STARTUPINFO
@@ -158,4 +162,13 @@ internal static partial class Native
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool CloseHandle(IntPtr handle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool TerminateJobObject(IntPtr job, uint exitCode);
 }

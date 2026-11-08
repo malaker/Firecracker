@@ -18,10 +18,10 @@
 [CmdletBinding(PositionalBinding = $false)]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('setup', 'doctor', 'run', 'shell', 'start', 'ssh', 'list', 'stop', 'cleanup', 'help')]
+    [ValidateSet('setup', 'doctor', 'run', 'shell', 'start', 'ssh', 'put', 'get', 'list', 'stop', 'cleanup', 'mcp', 'help')]
     [string]$Command = 'help',
 
-    # run-id for stop/ssh, optionally followed by a command for ssh.
+    # run-id for stop/ssh/put/get, followed by a command (ssh), a host path (put) or a guest path (get).
     [Parameter(Position = 1, ValueFromRemainingArguments = $true)]
     [string[]]$Rest,
 
@@ -46,7 +46,19 @@ param(
     [string]$Timeout,
     [switch]$Keep,
     [switch]$Boot,
-    [switch]$Yes
+    [switch]$Yes,
+
+    # put: guest folder (default /work/in). get: host folder (default runs\<run-id>\files).
+    [string]$Dest,
+
+    # run: write {"run_id","results_dir"} to this file as soon as the VM has an id.
+    [string]$RunInfoFile,
+
+    # mcp: folders whose files the agent may upload (default: the current folder),
+    # allow networked mode, and the concurrent session limit (default 4).
+    [string[]]$AllowRoot,
+    [switch]$AllowNetworked,
+    [int]$MaxSessions
 )
 
 $ErrorActionPreference = 'Stop'
@@ -58,9 +70,42 @@ function ConvertTo-WslPath([string]$Path) {
     '/mnt/' + $full.Substring(0, 1).ToLower() + ($full.Substring(2) -replace '\\', '/')
 }
 
+# Like ConvertTo-WslPath, for a path that may not exist yet (relative to the current folder).
+function ConvertTo-WslPathAny([string]$Path) {
+    if (-not [System.IO.Path]::IsPathRooted($Path)) { $Path = Join-Path (Get-Location).ProviderPath $Path }
+    $full = [System.IO.Path]::GetFullPath($Path)
+    '/mnt/' + $full.Substring(0, 1).ToLower() + ($full.Substring(2) -replace '\\', '/')
+}
+
 if ($Command -eq 'help') {
     & (Join-Path $PSScriptRoot 'windows\fcctl-win.ps1') help
     exit $LASTEXITCODE
+}
+
+# MCP server over stdio (spec: sandbox-mcp-tools). stdout belongs to the protocol: nothing
+# else may be written there, so fc-mcp.exe is started with the inherited stdio handles.
+if ($Command -eq 'mcp') {
+    $exe = & (Join-Path $PSScriptRoot 'mcp\install-mcp.ps1') -CheckOnly
+    if ($LASTEXITCODE -ne 0 -or -not $exe) {
+        [Console]::Error.WriteLine("[fc] ERROR: the MCP server is not built or is out of date; run '.\fc.ps1 setup' (needs the .NET 10 SDK).")
+        exit 125
+    }
+    $mcpArgs = [System.Collections.Generic.List[string]]::new()
+    $mcpArgs.Add('--repo-root'); $mcpArgs.Add($PSScriptRoot)
+    foreach ($r in @($AllowRoot | Where-Object { $_ })) {
+        $full = if ([System.IO.Path]::IsPathRooted($r)) { $r } else { Join-Path (Get-Location).ProviderPath $r }
+        $mcpArgs.Add('--allow-root'); $mcpArgs.Add($full)
+    }
+    if ($AllowNetworked) { $mcpArgs.Add('--allow-networked') }
+    if ($MaxSessions) { $mcpArgs.Add('--max-sessions'); $mcpArgs.Add("$MaxSessions") }
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = @($exe)[-1]
+    $psi.Arguments = ($mcpArgs | ForEach-Object { '"' + ($_ -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"' }) -join ' '
+    $psi.UseShellExecute = $false
+    $psi.WorkingDirectory = (Get-Location).ProviderPath
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $proc.WaitForExit()
+    exit $proc.ExitCode
 }
 
 if ($Guest -eq 'linux') {
@@ -86,11 +131,26 @@ if ($Guest -eq 'windows') {
         if ($NanoBase)  { $setupParams.NanoBase  = $NanoBase }
         & (Join-Path $PSScriptRoot 'windows\setup-nanoserver.ps1') @setupParams
         if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & (Join-Path $PSScriptRoot 'mcp\install-mcp.ps1')
+        if ($LASTEXITCODE) { [Console]::Error.WriteLine("[fc] WARNING: the MCP server was not built; 'fc.ps1 mcp' will not start.") }
         & (Join-Path $PSScriptRoot 'windows\fcctl-win.ps1') doctor @commonWin
         exit $LASTEXITCODE
     }
 
     $winParams = $commonWin.Clone()
+    if ($Command -in @('put', 'get')) {
+        if (-not $Rest -or $Rest.Count -ne 2) {
+            $what = if ($Command -eq 'put') { 'host-path' } else { 'guest-path' }
+            [Console]::Error.WriteLine("[fc] ERROR: usage: fc.ps1 $Command <run-id> <$what> -Guest windows [-Dest <folder>]")
+            exit 125
+        }
+        if ($Command -eq 'get') {
+            $hostDest = if ($Dest) { $Dest } else { Join-Path $PSScriptRoot "runs\$($Rest[0])\files" }
+            $winParams.Dest = if ([System.IO.Path]::IsPathRooted($hostDest)) { $hostDest } else { Join-Path (Get-Location).ProviderPath $hostDest }
+        } elseif ($Dest) {
+            $winParams.Dest = $Dest
+        }
+    }
     $winParams.Command = $Command
     if ($Rest)    { $winParams.Rest    = $Rest }
     if ($Payload) { $winParams.Payload = $Payload }
@@ -106,6 +166,9 @@ if ($Guest -eq 'windows') {
         $runs = Join-Path $PSScriptRoot 'runs'
         New-Item -ItemType Directory -Force -Path $runs | Out-Null
         $winParams.ResultsDir = $runs
+        if ($RunInfoFile) {
+            $winParams.RunInfoFile = if ([System.IO.Path]::IsPathRooted($RunInfoFile)) { $RunInfoFile } else { Join-Path (Get-Location).ProviderPath $RunInfoFile }
+        }
     }
 
     & (Join-Path $PSScriptRoot 'windows\fcctl-win.ps1') @winParams
@@ -115,12 +178,35 @@ if ($Guest -eq 'windows') {
 if ($Command -eq 'setup') {
     & (Join-Path $PSScriptRoot 'windows\setup-host.ps1') -Yes:$Yes
     if ($LASTEXITCODE) { exit $LASTEXITCODE }
+    & (Join-Path $PSScriptRoot 'mcp\install-mcp.ps1')
+    if ($LASTEXITCODE) { [Console]::Error.WriteLine("[fc] WARNING: the MCP server was not built; 'fc.ps1 mcp' will not start.") }
     & $PSCommandPath doctor
     exit $LASTEXITCODE
 }
 
 $argv = [System.Collections.Generic.List[string]]::new()
 $argv.Add($Command)
+if ($Command -in @('put', 'get')) {
+    if (-not $Rest -or $Rest.Count -ne 2) {
+        $what = if ($Command -eq 'put') { 'host-path' } else { 'guest-path' }
+        [Console]::Error.WriteLine("[fc] ERROR: usage: fc.ps1 $Command <run-id> <$what> [-Dest <folder>]")
+        exit 125
+    }
+    $argv.Add($Rest[0])
+    if ($Command -eq 'put') {
+        if (-not (Test-Path -LiteralPath $Rest[1])) {
+            [Console]::Error.WriteLine("[fc] ERROR: host path '$($Rest[1])' not found.")
+            exit 125
+        }
+        $argv.Add((ConvertTo-WslPath $Rest[1]))
+        if ($Dest) { $argv.Add($Dest) }
+    } else {
+        $argv.Add($Rest[1])
+        $hostDest = if ($Dest) { $Dest } else { Join-Path $PSScriptRoot "runs\$($Rest[0])\files" }
+        $argv.Add((ConvertTo-WslPathAny $hostDest))
+    }
+    $Rest = $null
+}
 if ($Rest) { $argv.AddRange([string[]]$Rest) }
 if ($Payload) {
     if (-not (Test-Path -LiteralPath $Payload -PathType Container)) {
@@ -141,6 +227,7 @@ if ($Command -eq 'run') {
     $runs = Join-Path $PSScriptRoot 'runs'
     New-Item -ItemType Directory -Force -Path $runs | Out-Null
     $argv.Add('--results-dir'); $argv.Add((ConvertTo-WslPath $runs))
+    if ($RunInfoFile) { $argv.Add('--run-info-file'); $argv.Add((ConvertTo-WslPathAny $RunInfoFile)) }
 }
 
 # Pass arguments as one base64 blob of NUL-terminated values so wsl.exe can't

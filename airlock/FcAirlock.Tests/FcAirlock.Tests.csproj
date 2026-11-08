@@ -20,6 +20,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\FcAirlock.Core\FcAirlock.Core.csproj" />
+    <ProjectReference Include="..\..\windows\common\FcWinToken\FcWinToken.csproj" />
   </ItemGroup>
 
 </Project>

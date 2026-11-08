@@ -1,10 +1,11 @@
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 
-namespace FcEgress;
+namespace FcWin;
 
 // Describes the current process token, so 'serve' can report (and refuse to run with) admin rights.
-internal static class TokenInfo
+[System.Runtime.Versioning.SupportedOSPlatform("windows")]
+public static class TokenInfo
 {
     private const int TokenElevation = 20;
     private const int TokenIntegrityLevel = 25;

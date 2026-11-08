@@ -17,6 +17,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\FcAirlock.Core\FcAirlock.Core.csproj" />
+    <!-- Windows-only 'launch-unpack'; compiled for linux-x64 too but never called there. -->
+    <ProjectReference Include="..\..\windows\common\FcWinToken\FcWinToken.csproj" />
   </ItemGroup>
 
 </Project>

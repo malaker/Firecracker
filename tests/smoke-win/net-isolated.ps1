@@ -8,6 +8,7 @@ $FcPs1    = Join-Path $RepoRoot 'fc.ps1'
 . (Join-Path $RepoRoot 'windows\lib\state.ps1')
 . (Join-Path $RepoRoot 'windows\lib\runtime.ps1')
 . (Join-Path $RepoRoot 'windows\lib\net.ps1')
+. (Join-Path $PSScriptRoot 'smoke-lib.ps1')
 
 Write-Host "[smoke-win:net-isolated] 1. Start isolated Windows microVM, check ipconfig and verify outbound connection fails..."
 $id = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $FcPs1 start -Guest windows -WinRuntime $WinRuntime -Net isolated).Trim()
@@ -26,11 +27,11 @@ try {
 
 Write-Host "[smoke-win:net-isolated] 2. Run payload in isolated mode and verify C:\work\in -> C:\work\out tar collection..."
 $sampleDir = Join-Path $RepoRoot 'samples\hello-win'
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $FcPs1 run -Guest windows -WinRuntime $WinRuntime -Net isolated -Payload $sampleDir -Cmd '.\in\hello.cmd'
-if ($LASTEXITCODE -ne 0) {
-    throw "Isolated payload run failed with exit code $LASTEXITCODE"
+$isoRun = Invoke-FcSmokeRun $FcPs1 @('-Guest', 'windows', '-WinRuntime', $WinRuntime, '-Net', 'isolated', '-Payload', $sampleDir, '-Cmd', '.\in\hello.cmd')
+if ($isoRun.ExitCode -ne 0) {
+    throw "Isolated payload run failed with exit code $($isoRun.ExitCode)"
 }
-$latestRun = Get-ChildItem -LiteralPath (Join-Path $RepoRoot 'runs') -Directory | Sort-Object Name | Select-Object -Last 1
+$latestRun = Get-Item -LiteralPath $isoRun.ResultsDir
 $whoamiFile = Join-Path $latestRun.FullName 'out\whoami.txt'
 if (-not (Test-Path -LiteralPath $whoamiFile)) {
     throw "Expected output file '$whoamiFile' was not collected in isolated mode"

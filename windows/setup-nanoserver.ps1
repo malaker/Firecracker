@@ -182,5 +182,11 @@ if ($BuildFromSource) {
 # 6. Build the networked-mode egress proxy (host) and relay (guest).
 [void](Install-FcWinEgress (Join-Path $PSScriptRoot 'egress'))
 
+# 7. Guest output airlock tool (needs the .NET 10 SDK; collecting run output depends on it).
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path (Split-Path -Parent $PSScriptRoot) 'airlock\install-airlock.ps1') -Rid win-x64 | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Stop-FcWithError "Building the guest output airlock tool failed (see the message above)." $script:EXIT_INFRA
+}
+
 Write-FcLog "Windows Nano Server microVM setup complete (runtime=$WinRuntime, image=$imageRef)."
 exit 0

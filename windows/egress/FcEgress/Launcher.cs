@@ -2,7 +2,9 @@ using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
-using static FcEgress.Native;
+using FcWin;
+using static FcWin.Native;
+using static FcWin.RestrictedLaunch;
 
 namespace FcEgress;
 
@@ -48,7 +50,8 @@ internal static class Launcher
 
             token = RestrictedToken();
             serve = Spawn(token, $"{Quote(self)} serve --policy {Quote(policy)}", g2hRead, h2gWrite, serveErr, suspended: true);
-            job = LimitingJob();
+            // No child processes, bounded memory. Not kill-on-close: serve must outlive launch.
+            job = LimitingJob(1, ServeMemoryLimit, killOnClose: false);
             Check(AssignProcessToJobObject(job, serve.hProcess), "AssignProcessToJobObject");
             if (ResumeThread(serve.hThread) == uint.MaxValue) throw new Win32Exception(Marshal.GetLastWin32Error(), "ResumeThread");
 
@@ -72,120 +75,8 @@ internal static class Launcher
         }
     }
 
-    // Each child inherits exactly its own three handles. The explicit handle list matters:
-    // with plain inheritance a child also gets every inheritable handle launch itself
-    // inherited (e.g. a caller's stderr pipe), and since the children live as long as the VM,
-    // that caller would wait for EOF until the VM is destroyed.
-    private static PROCESS_INFORMATION Spawn(IntPtr token, string commandLine, SafeHandle stdin, SafeHandle stdout, SafeHandle stderr, bool suspended)
-    {
-        var handles = new[] { stdin, stdout, stderr };
-        foreach (var h in handles) Check(SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT), "SetHandleInformation");
-        IntPtr attrList = IntPtr.Zero, handleArray = IntPtr.Zero;
-        try
-        {
-            var distinct = handles.Select(h => h.DangerousGetHandle()).Distinct().ToArray();
-            handleArray = Marshal.AllocHGlobal(IntPtr.Size * distinct.Length);
-            Marshal.Copy(distinct, 0, handleArray, distinct.Length);
-
-            IntPtr size = IntPtr.Zero;
-            InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
-            attrList = Marshal.AllocHGlobal(size);
-            Check(InitializeProcThreadAttributeList(attrList, 1, 0, ref size), "InitializeProcThreadAttributeList");
-            Check(UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handleArray,
-                (IntPtr)(IntPtr.Size * distinct.Length), IntPtr.Zero, IntPtr.Zero), "UpdateProcThreadAttribute");
-
-            var si = new STARTUPINFOEX
-            {
-                StartupInfo = new STARTUPINFO
-                {
-                    cb = Marshal.SizeOf<STARTUPINFOEX>(),
-                    dwFlags = STARTF_USESTDHANDLES,
-                    hStdInput = stdin.DangerousGetHandle(),
-                    hStdOutput = stdout.DangerousGetHandle(),
-                    hStdError = stderr.DangerousGetHandle(),
-                },
-                lpAttributeList = attrList,
-            };
-            uint flags = CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT | (suspended ? CREATE_SUSPENDED : 0);
-            var cmd = new StringBuilder(commandLine);
-            PROCESS_INFORMATION pi;
-            bool ok = token == IntPtr.Zero
-                ? CreateProcessW(null, cmd, IntPtr.Zero, IntPtr.Zero, true, flags, IntPtr.Zero, null, ref si, out pi)
-                : CreateProcessAsUserW(token, null, cmd, IntPtr.Zero, IntPtr.Zero, true, flags, IntPtr.Zero, null, ref si, out pi);
-            Check(ok, token == IntPtr.Zero ? "CreateProcess" : "CreateProcessAsUser");
-            return pi;
-        }
-        finally
-        {
-            if (attrList != IntPtr.Zero)
-            {
-                DeleteProcThreadAttributeList(attrList);
-                Marshal.FreeHGlobal(attrList);
-            }
-            if (handleArray != IntPtr.Zero) Marshal.FreeHGlobal(handleArray);
-            foreach (var h in handles) SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
-        }
-    }
-
-    // Same restriction as 'runas /trustlevel:0x20000' (Administrators becomes deny-only and
-    // privileges are dropped), then lowered from High to Medium integrity.
-    private static IntPtr RestrictedToken()
-    {
-        Check(SaferCreateLevel(SAFER_SCOPEID_USER, SAFER_LEVELID_NORMALUSER, SAFER_LEVEL_OPEN, out var level, IntPtr.Zero), "SaferCreateLevel");
-        IntPtr token;
-        try
-        {
-            Check(SaferComputeTokenFromLevel(level, IntPtr.Zero, out token, 0, IntPtr.Zero), "SaferComputeTokenFromLevel");
-        }
-        finally
-        {
-            SaferCloseLevel(level);
-        }
-
-        Check(ConvertStringSidToSidW("S-1-16-8192", out var medium), "ConvertStringSidToSid");
-        try
-        {
-            var label = new TOKEN_MANDATORY_LABEL { Label = new SID_AND_ATTRIBUTES { Sid = medium, Attributes = SE_GROUP_INTEGRITY } };
-            int size = Marshal.SizeOf<TOKEN_MANDATORY_LABEL>() + GetLengthSid(medium);
-            if (!SetTokenInformation(token, TokenIntegrityLevelClass, ref label, size))
-            {
-                int err = Marshal.GetLastWin32Error();
-                CloseHandle(token);
-                throw new Win32Exception(err, "SetTokenInformation(TokenIntegrityLevel)");
-            }
-        }
-        finally
-        {
-            LocalFree(medium);
-        }
-        return token;
-    }
-
-    // No child processes, bounded memory. Not kill-on-close: serve must outlive launch.
-    private static IntPtr LimitingJob()
-    {
-        var job = CreateJobObjectW(IntPtr.Zero, null);
-        if (job == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateJobObject");
-        var info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION
-        {
-            BasicLimitInformation = new JOBOBJECT_BASIC_LIMIT_INFORMATION
-            {
-                LimitFlags = JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
-                ActiveProcessLimit = 1,
-            },
-            ProcessMemoryLimit = (UIntPtr)ServeMemoryLimit,
-        };
-        Check(SetInformationJobObject(job, JobObjectExtendedLimitInformation, ref info, Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()), "SetInformationJobObject");
-        return job;
-    }
-
     private static SafeFileHandle OpenLog(string path) =>
         File.OpenHandle(path, FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
 
     private static string Quote(string s) => s.Contains(' ') || s.Contains('"') ? "\"" + s.Replace("\"", "\\\"") + "\"" : s;
-
-    private static void Check(bool ok, string what)
-    {
-        if (!ok) throw new Win32Exception(Marshal.GetLastWin32Error(), what);
-    }
 }

@@ -36,6 +36,14 @@ airlock_tool_env() {
 
 _airlock_result() { AIRLOCK_STATUS="$1" AIRLOCK_REASON="$2" AIRLOCK_FILES="${3:-0}" AIRLOCK_BYTES="${4:-0}"; }
 
+# _airlock_early_fail <reason> <after-pull-command>: failure before the airlock pipeline starts.
+_airlock_early_fail() {
+  _airlock_result failed "$1"
+  log "collection failed: $1"
+  [ -n "$2" ] && $2
+  return 1
+}
+
 # Reason from fc-airlock's one-line stderr ("refused: ...", "malformed: ...", "error: ...").
 _airlock_reason() {
   local line
@@ -55,37 +63,50 @@ _airlock_claim_uid() {
   return 1
 }
 
-# airlock_transfer <src-id> <guest-dir> <dest-dir> [after-pull-command]
-# Copies <guest-dir> of running VM <src-id> into <dest-dir>, which must not exist or be empty.
+# airlock_transfer <src-id> <guest-path> <dest-dir> [after-pull-command] [missing=ok|error]
+# Copies <guest-path> of running VM <src-id> into <dest-dir>, which must not exist or be empty:
+# a folder's contents, or a single file (archived from its parent folder by name).
 # after-pull-command runs once the guest's bytes are on the host (cmd_run destroys the
-# source VM there). Sets AIRLOCK_STATUS (ok|refused|failed), AIRLOCK_REASON, AIRLOCK_FILES,
-# AIRLOCK_BYTES; returns 0 only for ok. Never exits the controller.
+# source VM there). A missing guest path is an empty transfer unless missing=error.
+# Sets AIRLOCK_STATUS (ok|refused|failed), AIRLOCK_REASON, AIRLOCK_FILES, AIRLOCK_BYTES;
+# returns 0 only for ok. Never exits the controller.
 airlock_transfer() {
   local -
   set +e
-  local src="$1" gdir="$2" dest="$3" after="${4:-}"
-  local cap work qdir rc aid="" uid="" env_kv size first
+  local src="$1" gpath="$2" dest="$3" after="${4:-}" missing="${5:-ok}"
+  local cap work qpath qparent qname tarspec rc aid="" uid="" env_kv size probe kind
 
   _airlock_result failed "" 0 0
   cap="$(airlock_stream_cap)"
-  printf -v qdir '%q' "$gdir"
+  printf -v qpath '%q' "$gpath"
   env_kv="$(airlock_tool_env)"
 
   if [ -e "$dest" ] && [ -n "$(ls -A "$dest" 2>/dev/null)" ]; then
-    _airlock_result failed "destination $dest is not empty"
-    [ -n "$after" ] && $after
+    _airlock_early_fail "destination $dest is not empty" "$after"
     return 1
   fi
 
-  # 1. Empty or missing folder: nothing to transfer, no airlock (the guest only hurts itself by lying).
-  first="$(fc_ssh "$src" "[ -d $qdir ] && find $qdir -mindepth 1 -print -quit" </dev/null 2>/dev/null)"
+  # 1. What is there? An empty or missing folder needs no airlock (a lying guest only hurts itself).
+  # A symbolic link is reported as a file so that its archive entry reaches the validator.
+  probe="$(fc_ssh "$src" "if [ -L $qpath ] || [ -f $qpath ]; then echo f; elif [ -d $qpath ]; then echo d; find $qpath -mindepth 1 -print -quit; elif [ -e $qpath ]; then echo f; else echo missing; fi" </dev/null 2>/dev/null)"
   rc=$?
   if (( rc == 255 )); then
-    _airlock_result failed "could not reach VM $src to read its output"
-    [ -n "$after" ] && $after
+    _airlock_early_fail "could not reach VM $src to read its output" "$after"
     return 1
   fi
-  if [ -z "$first" ]; then
+  kind="$(head -n1 <<<"$probe")"
+  if [ "$kind" = missing ] && [ "$missing" = error ]; then
+    _airlock_early_fail "guest path $gpath does not exist" "$after"
+    return 1
+  fi
+  if [ "$kind" = f ]; then
+    printf -v qparent '%q' "$(dirname -- "$gpath")"
+    printf -v qname '%q' "$(basename -- "$gpath")"
+    tarspec="-C $qparent -cf - -- $qname"
+  else
+    tarspec="-C $qpath -cf - ."
+  fi
+  if [ "$kind" != f ] && [ -z "$(tail -n +2 <<<"$probe")" ]; then
     [ -n "$after" ] && $after
     mkdir -p "$dest"
     _airlock_result ok "" 0 0
@@ -93,11 +114,11 @@ airlock_transfer() {
   fi
 
   mkdir -p "$FC_STAGING"
-  work="$(mktemp -d "$FC_STAGING/$src.XXXXXX")" || { _airlock_result failed "cannot create staging folder"; [ -n "$after" ] && $after; return 1; }
+  work="$(mktemp -d "$FC_STAGING/$src.XXXXXX")" || { _airlock_early_fail "cannot create staging folder" "$after"; return 1; }
   chmod 0711 "$work"
 
   # 2. Pull the guest's archive as opaque bytes, capped.
-  timeout -k 5 "$AIRLOCK_PULL_TIMEOUT" bash -c 'fc_ssh "$@"' _ "$src" "tar -C $qdir -cf - ." </dev/null 2>"$work/pull.err" \
+  timeout -k 5 "$AIRLOCK_PULL_TIMEOUT" bash -c 'fc_ssh "$@"' _ "$src" "tar $tarspec" </dev/null 2>"$work/pull.err" \
     | head -c $(( cap + 1 )) > "$work/S"
   rc=("${PIPESTATUS[@]}")
   [ -n "$after" ] && $after

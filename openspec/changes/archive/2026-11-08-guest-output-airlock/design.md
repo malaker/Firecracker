@@ -93,6 +93,12 @@ The elevated `fcctl-win.ps1` starts `fc-airlock.exe unpack` through a restricted
 
 Staging is `%TEMP%\fc-airlock-<id>-<guid>` of the user. Step 8 rejects any reparse point before `Move-Item` into `runs\<id>\out`. Closing the job kills any leftover processes before step 8.
 
+Windows details found during implementation:
+- **Links in the guest are refused before the pull.** Windows `tar.exe` follows junctions and directory links and archives what they point to as regular files, so the validator would never see a link. The probe in step 1 therefore also lists reparse points (`dir /s /b /a:l`) and refuses the transfer by name. The guest answers this; a guest that hides a link only gets its own files collected, within the limits.
+- **The pull's exit code is not trusted.** A guest `tar` that warns (for example about unreadable files) exits non-zero. Whatever bytes arrived go to the airlock, which decides; only an empty pull with an error is a failed read.
+- **The pull is capped while it streams.** `FcProc.RunCapped` stops writing at the stream cap and kills the exec, so a guest cannot fill the host disk before the size check.
+- **Case collisions cannot come from a Windows guest:** its NTFS is case-insensitive and Nano Server has no `fsutil` to change that. The rule still applies on the host check.
+
 ### D8. Validator delivery and guest identity
 - **Linux:** `upload_dir` puts `fc-airlock` into `/opt/fc-airlock/` in the airlock, and the validator runs as `setpriv --reuid=65534 --regid=65534 --clear-groups` (`nobody`).
 - **Windows:** `Send-FcWinGuestFiles` puts `fc-airlock.exe` into `C:\fc\`, and `exec -u ContainerUser` runs it.
@@ -138,7 +144,8 @@ Task 1.1 spike, 2026-11-07, Windows 11 26200, WSL 2.6.3, Firecracker v1.17.0.
 
 - **Linux airlock** (1 vCPU / 256 MiB, isolated; `fcctl start` + `ssh true`), 10 runs: median 7.4 s, best 1.4 s, worst 7.8 s. Almost all of it is `start`; the first `ssh` adds about 150 ms. The two clusters (about 1.5 s and about 7.5 s) come from the existing `wait_ssh` loop: an SSH attempt made before the guest's sshd listens appears to wait out `ConnectTimeout=5`. A shorter connect timeout in `wait_ssh` would help every VM, not only airlocks; out of scope here.
 - **Linux collection end to end** (`airlock_transfer` of two small files): 9.1 s.
-- **Windows airlock**: not measured yet (needs an elevated prompt). Script: `spike-windows.ps1` from the session scratchpad.
+- **Windows airlock, containerd** (1 vCPU / 256 MiB, isolated; `start -Guest windows` + `ssh <id> ver`), 5 runs: median 4.7 s, best 4.5 s, worst 5.7 s; `start` is about 3.5 s of it. Well under the 30 s gate.
+- **Windows airlock, docker** (same settings), 5 runs on 2026-11-08: median 3.4 s, best 3.3 s, worst 4.0 s. On 2026-11-07 docker could not be measured: every `docker run --network=none --isolation=hyperv` failed with `error during connect ... /start: EOF` or hung, also after restarting the docker service; a reboot of the host fixed it. Nothing in fc-sandbox was involved.
 
 ## Open Questions
 

@@ -145,9 +145,13 @@ function Write-FcWinRunResultMeta {
         [Parameter(Mandatory = $true)][string]$PayloadPath,
         $ExitCode = $null,
         [bool]$TimedOut = $false,
-        [string]$ErrorMessage = ''
+        [string]$ErrorMessage = '',
+        # How out\ was collected through the airlock: status, reason, files, bytes.
+        $Collection = $null,
+        # VM state captured before the VM was released (its state dir may be gone by now).
+        $VmMeta = $null
     )
-    $vmMeta = Get-FcWinVmMeta $RunId
+    $vmMeta = if ($VmMeta) { $VmMeta } else { Get-FcWinVmMeta $RunId }
     if (-not $vmMeta) { return }
 
     New-Item -ItemType Directory -Force -Path $ResultsDir | Out-Null
@@ -175,6 +179,7 @@ function Write-FcWinRunResultMeta {
         timed_out   = $TimedOut
         error       = $errVal
         keep_disk   = [bool]$vmMeta.keep_disk
+        collection  = $Collection
     }
     $metaPath = Join-Path $ResultsDir 'meta.json'
     $tmpPath  = "$metaPath.tmp"

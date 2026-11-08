@@ -70,6 +70,10 @@ function Invoke-WinDoctor {
         Write-Host "         hint: install the .NET 10 SDK and rerun '.\fc.ps1 setup -Guest windows'"
     }
 
+    Test-Check "guest output airlock tool (fc-airlock.exe)" `
+        "rerun '.\fc.ps1 setup -Guest windows' in an elevated prompt (needs the .NET 10 SDK)" `
+        { Test-FcWinAirlockPresent }
+
     Test-Check "Windows runtime '$WinRuntime' binaries installed" `
         "run '.\fc.ps1 setup -Guest windows -WinRuntime $WinRuntime'" `
         { Test-FcWinRuntimeBinariesPresent $WinRuntime }

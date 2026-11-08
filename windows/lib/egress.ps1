@@ -22,7 +22,9 @@ function Get-FcDotnetSdk10 {
 # Rebuilds only when a source file is newer than the published binaries. Without a .NET 10
 # SDK it warns and returns $false: isolated mode still works, networked mode will refuse.
 function Install-FcWinEgress([string]$SourceDir) {
-    $sources = @(Get-ChildItem -LiteralPath $SourceDir -Recurse -File -Include *.cs, *.csproj |
+    # fc-egress also compiles the shared restricted-launch code in windows\common.
+    $commonDir = Join-Path (Split-Path -Parent $SourceDir) 'common'
+    $sources = @(Get-ChildItem -LiteralPath @($SourceDir, $commonDir) -Recurse -File -Include *.cs, *.csproj -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -notmatch '\\(bin|obj|FcEgress\.Tests)\\' })
     $newestSource = ($sources | Measure-Object -Property LastWriteTimeUtc -Maximum).Maximum
     if (Test-FcWinEgressPresent) {

@@ -44,6 +44,22 @@ function Invoke-FcSmokeLimitationSkip([string]$Feature, [string]$WinRuntime, [st
     return $true
 }
 
+# Runs 'fc.ps1 run <RunArgs>' and returns its exit code and the run's own results folder, read
+# from -RunInfoFile. (Guessing "the newest folder in runs\" breaks: Linux run ids use the WSL
+# distro's local time, Windows ids use UTC, and MCP session folders live there too.)
+function Invoke-FcSmokeRun([string]$FcPs1, [string[]]$RunArgs) {
+    $info = Join-Path ([System.IO.Path]::GetTempPath()) "fc-smoke-run-$([guid]::NewGuid().ToString('N')).json"
+    # Under 'Stop', Windows PowerShell 5.1 would turn the run's stderr lines into errors.
+    $ErrorActionPreference = 'Continue'
+    # The run's console output (stdout and stderr) is shown and returned, not emitted as values.
+    $out = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $FcPs1 run @RunArgs -RunInfoFile $info 2>&1 | ForEach-Object { "$_" })
+    $rc = $LASTEXITCODE
+    $out | Out-Host
+    $dir = if (Test-Path -LiteralPath $info) { [string](Get-Content -LiteralPath $info -Raw | ConvertFrom-Json).results_dir } else { $null }
+    Remove-Item -LiteralPath $info -Force -ErrorAction SilentlyContinue
+    [pscustomobject]@{ ExitCode = $rc; ResultsDir = $dir; Output = ($out -join "`n") }
+}
+
 # Every declared limitation of $WinRuntime must have a probe.
 function Assert-FcSmokeProbesComplete([string]$WinRuntime) {
     foreach ($lim in Get-FcWinRuntimeLimitations $WinRuntime) {

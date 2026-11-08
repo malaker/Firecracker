@@ -3,4 +3,5 @@
   <Project Path="FcEgress.Tests/FcEgress.Tests.csproj" />
   <Project Path="FcEgress/FcEgress.csproj" />
   <Project Path="FcRelay/FcRelay.csproj" />
+  <Project Path="../common/FcWinToken/FcWinToken.csproj" />
 </Solution>

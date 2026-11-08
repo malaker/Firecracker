@@ -27,6 +27,10 @@ flowchart LR
     lvm -. "tap + NAT<br/>(networked only)" .-> internet(("Internet"))
     wvm -. "proxy frames over exec<br/>(networked only)" .-> egress
     egress -. "policy-checked TCP" .-> internet
+    lvm -. "out/ as opaque bytes" .-> lair["airlock microVM<br/>fc-airlock validate"]
+    wvm -. "out\ as opaque bytes" .-> wair["airlock Utility VM<br/>fc-airlock validate"]
+    lair -- "checked manifest + blob<br/>(unpacked unprivileged)" --> fcctl
+    wair -- "checked manifest + blob<br/>(unpacked unprivileged)" --> fcwin
     fcctl --> runs
     fcwin --> runs
 ```
@@ -39,13 +43,14 @@ flowchart LR
 - **Hard timeouts.** A detached watchdog enforces every VM's lifetime, even if the controller crashes.
 - **Two network modes.** `isolated` has no network device at all. `networked` has controlled egress with the host and private ranges blocked, plus an optional destination allowlist: NAT-ed through nftables for Linux guests, and through a host-side egress proxy for Windows guests, which still have no network adapter.
 - **Simple results.** Each run's exit code, stdout/stderr, metadata and output files are collected into `runs\<run-id>\` on Windows.
+- **Guest output airlock.** Output files never reach the host by unpacking a guest's archive: a fresh airlock VM validates and re-encodes them, and the host checks the result again without admin rights before writing anything. Links, devices, unsafe names and oversized output are refused. See [Guest output airlock](#guest-output-airlock).
 
 ## Requirements
 
 - Windows 11 with a CPU that has hardware virtualization (Intel VT-x or AMD-V) enabled in firmware
 - **For `-Guest linux` (default):** WSL 2 (a recent version that supports `wsl --install <distro> --name`) and WSL2 nested virtualization (on by default on Windows 11; setup offers to enable it if needed)
 - **For `-Guest windows`:** An elevated (Administrator) PowerShell prompt, plus the Windows `Microsoft-Hyper-V` and `Containers` optional features (setup offers to enable them if needed)
-- **For `-Guest windows -Net networked`:** the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0), used by setup to build the egress proxy (`fc-egress.exe`) and the guest relay (`fc-relay.exe`). Without it, setup warns and only `-Net isolated` works.
+- **The [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)** (**breaking change:** earlier versions needed it only for Windows networked mode), used by setup to build the guest output airlock tool (`fc-airlock`) and the MCP server (`fc-mcp.exe`). Linux and Windows setup both fail without it, because run output is collected through the airlock. For `-Guest windows -Net networked` it also builds the egress proxy (`fc-egress.exe`) and the guest relay (`fc-relay.exe`).
 - About 6 GB of free disk space and internet access during setup
 
 Tested with Windows 11 build 26200, WSL 2.6.3 (kernel 6.6.87), Firecracker v1.17.0, and Nano Server 2025 (`ltsc2025`).
@@ -180,7 +185,10 @@ Remove-Item -Recurse -Force C:\ProgramData\containerd
 | `.\fc.ps1 shell [options]` | Boot a VM and open an interactive root / `ContainerAdministrator` shell; the VM is destroyed on exit |
 | `.\fc.ps1 start [options]` | Boot a VM in the background and print its run id |
 | `.\fc.ps1 ssh <run-id> ['<command>']` | Open a shell in, or run a command in, a started VM |
-| `.\fc.ps1 list` | List VMs: `running`, `dead` (process gone, e.g. after a WSL/service restart) or `kept` |
+| `.\fc.ps1 put <run-id> <host-path> [-Dest <guest-dir>]` | Copy a host file, or a folder's contents, into a started VM (default `/work/in`, or `C:\work\in` on Windows) |
+| `.\fc.ps1 get <run-id> <guest-path> [-Dest <host-dir>]` | Copy a guest file or folder out of a started VM through the [guest output airlock](#guest-output-airlock) into an empty or new folder (default `runs\<run-id>\files\`). Exits `1` when the airlock refuses the files (links, devices, unsafe names, over the limits) or the guest path does not exist, and writes nothing |
+| `.\fc.ps1 mcp [-AllowRoot <dir>[,...]] [-AllowNetworked] [-MaxSessions <n>]` | Run the [MCP server](#mcp-server-fcps1-mcp) over stdio, for an MCP client to launch |
+| `.\fc.ps1 list` | List VMs: `running`, `dead` (process gone, e.g. after a WSL/service restart) or `kept`. `ROLE` is `vm`, or `airlock:<run-id>` for an airlock collecting that run's output |
 | `.\fc.ps1 stop <run-id>` | Destroy a VM (process, jail/Utility VM, disk copy/container, tap device and firewall rules on Linux, egress proxy on Windows) |
 | `.\fc.ps1 cleanup` | Destroy every VM and remove all leftovers, including kept disks and orphans from crashes. Without `-Guest` it covers both backends. Windows VMs can only be destroyed from an elevated prompt; without elevation their state is left untouched and the command fails |
 | `.\fc.ps1 doctor [-Boot]` | Run preflight checks |
@@ -272,15 +280,86 @@ Every `run` writes `runs\<run-id>\` (run ids look like `20261027-183001-3461`):
 | `exit_code` | Exit code of the run |
 | `stdout.log`, `stderr.log` | Output of the guest command, written as it runs (kept on timeout) |
 | `out\` | Everything the command wrote to `/work/out` (Linux) or `C:\work\out` (Windows) in the guest |
-| `meta.json` | Run id, command, payload, network mode, allowlist, vCPU, memory, timeout, start/end time, `timed_out`, `error`, plus `firecracker` (Linux) or `guest`, `flavour`, `image_repo`, `win_runtime` (Windows) |
+| `meta.json` | Run id, command, payload, network mode, allowlist, vCPU, memory, timeout, start/end time, `timed_out`, `error`, `collection` (Linux: how `out\` was collected through the [airlock](#guest-output-airlock)), plus `firecracker` (Linux) or `guest`, `flavour`, `image_repo`, `win_runtime` (Windows) |
 | `net.log` | Windows `networked` runs only: one line per connection attempt with `decision` (`allowed`, `denied`, `failed`), `host`, `port`, the resolved `ip`, `reason` and `bytes_up`/`bytes_down` (kept on timeout) |
 
 Exit codes: the guest command's own exit code; **124** when the run hit its timeout; **125** when the sandbox itself failed (boot, upload, missing payload). For commands that can themselves exit with 124 or 125, `timed_out` and `error` in `meta.json` tell the cases apart.
 
 Inside the guest the payload is at `/work/in` (Linux) or `C:\work\in` (Windows) and the working directory is `/work` or `C:\work`, so `-Cmd './in/scan.sh'` (Linux) or `-Cmd '.\in\hello.cmd'` (Windows) runs a script from the payload. Files written to `out/` are copied back. Commands run as `root` (Linux) or `ContainerAdministrator` (Windows). The Linux guest image is a minimal Ubuntu 24.04 with `curl`, `socat`, `iproute2` and `openssh`. The Windows Nano Server 2025 flavours include `curl.exe`, `tar.exe`, 32-bit `SysWOW64` (on `-x86` flavours), `nanoserver_sta_shim.dll`, and `.NET 10` or `.NET Framework 4.8.1`.
 
+## MCP server (`fc.ps1 mcp`)
+
+`fc.ps1 mcp` exposes the sandbox to any MCP client (Claude Code, other stdio MCP clients) as tools, so an agent on the host can send risky work (detonating a sample, running an exploit PoC or an untrusted installer) into a disposable VM instead of running it on the host. The server is a policy layer over `fc.ps1`; isolation comes entirely from the backends described above.
+
+**Prerequisites:** the .NET 10 SDK. `.\fc.ps1 setup` builds the server into `%LOCALAPPDATA%\fc-sandbox\mcp\` (and rebuilds it only when its sources change). Without a build, `fc.ps1 mcp` exits `125` with a message on stderr and writes nothing to stdout.
+
+**Register it with Claude Code** (run from the folder whose files the agent may upload, usually your project):
+
+```powershell
+claude mcp add fc-sandbox -- powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\sources\Firecracker\fc.ps1 mcp
+```
+
+Any other stdio MCP client takes the same command, for example:
+
+```json
+{
+  "mcpServers": {
+    "fc-sandbox": {
+      "command": "powershell.exe",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "C:\\sources\\Firecracker\\fc.ps1", "mcp"]
+    }
+  }
+}
+```
+
+**Options:**
+
+| Option | Default | Description |
+|---|---|---|
+| `-AllowRoot <dir>[,...]` | the folder the server starts in | Host folders whose files `sandbox_run` and `sandbox_put` may upload. Paths are resolved through junctions and links first; a payload that contains a link or junction is refused |
+| `-AllowNetworked` | off | Allow `net: networked`. Without it every networked request is refused and VMs have no network at all |
+| `-MaxSessions <n>` | 4 | Concurrent sessions (1-64) |
+
+**Tools:**
+
+| Tool | Does |
+|---|---|
+| `sandbox_run` | One-shot run, like `fc.ps1 run`: payload, command and VM options (`guest`, `net`, `allow`, `vcpu`, `mem_mib`, `timeout`, `flavour`). Returns run id, exit code, timeout flag, stdout/stderr, result folder and output files |
+| `sandbox_start` | Start a VM that stays up between calls; returns a session id |
+| `sandbox_exec` | Run a command in a session in `/work`; state persists. Full logs go to `runs\<session>\exec\<n>\` |
+| `sandbox_put` | Copy a host file or folder (inside the allowed roots) into a session |
+| `sandbox_get` | Copy a guest file or folder out through the guest output airlock into `runs\<session>\files\<n>\`; the agent cannot choose the host destination |
+| `sandbox_list` | This server's sessions |
+| `sandbox_stop` | Destroy a session |
+
+**Rules the server enforces:**
+
+- **Ownership:** session tools act only on VMs this server process started; VMs started from the CLI or by another server are invisible to them.
+- **Cleanup:** sessions keep the normal hard timeout (default 30 minutes). When the client disconnects or the server is stopped (Ctrl+C, console closed), the server destroys all its sessions. If the server process is killed outright, the VMs' watchdogs still destroy them at their timeout; `fc.ps1 cleanup` removes them earlier.
+- **Bounded, marked output:** each returned stdout/stderr is at most 64 KiB (beginning and end, with a `[... N bytes omitted ...]` marker); the full logs stay in `runs\`. Guest output is stripped of terminal escape sequences and control characters, follows a fixed notice that it is untrusted data, and sits between delimiters that carry a random value per call, so guest output cannot fake the end of its own block.
+- **No host-side actions:** the server has no tool that runs a host command, reads host files other than uploads from the allowed roots, or writes outside `runs\`.
+- **Windows guests** need the MCP server to run elevated, which means starting the MCP client from an elevated prompt. Otherwise Windows-guest calls are refused.
+
+**Recommended client settings:** guest output is attacker-controlled. Keep the client's own permission prompts on for shell and file-writing tools while working with untrusted samples, and do not let the agent auto-approve host commands suggested by sandbox output.
+
+### Guest output airlock
+
+Files never reach the host by unpacking a guest's archive on the host. Every copy out of a guest (`run`'s `out\` and `get`) goes through a fresh airlock VM of the same guest OS: a Firecracker microVM for Linux guests, a Hyper-V isolated Nano Server VM for Windows guests.
+
+1. The host copies the guest's tar stream as opaque bytes, capped in size while it streams.
+2. A new isolated airlock VM (1 vCPU, 256 MiB, 5-minute lifetime) reads the stream as an unprivileged user (`nobody` on Linux, `ContainerUser` on Windows) with `fc-airlock validate`. It accepts only regular files and directories with names that are safe on NTFS (no `..`, absolute paths, `:`, reserved device names such as `con.txt`, trailing dots or spaces, or names that differ only in case), within 1 GiB, 10,000 entries and 1 GiB per file, and re-encodes them as a blob plus a manifest with SHA-256 hashes. The airlock is then destroyed.
+3. On the host, `fc-airlock unpack` checks every rule, byte range and hash again and writes into an empty staging folder, without admin or root rights: as a throwaway uid inside `fc-host` for Linux guests, and through `fc-airlock launch-unpack` (a non-admin, Medium-integrity token in a kill-on-close job) for Windows guests, whose controller runs elevated. Only directories and regular files are moved into place, all at once or not at all.
+
+Windows guests: `tar.exe` follows junctions and directory links instead of archiving them, so links in a Windows guest's output are found and refused before the copy starts (`junction or symbolic link is not allowed: './<name>'`).
+
+A refused collection keeps the guest command's exit code, leaves `out\` empty, prints `collection refused: <reason>`, and is recorded in `meta.json` under `collection` (`status` `ok`, `refused` or `failed`, with `reason`, `files` and `bytes`). Runs with no output start no airlock. While a collection runs, `list` shows the airlock with role `airlock:<run-id>`.
+
 ## Security considerations and limitations
 
+- **MCP server and prompt injection:** a sample's output reaches the host agent through the MCP tools. The server bounds and marks that output and offers no host-side tools, but a marker does not stop a model from following instructions in it; the client's permission settings remain the final control.
+- **Elevated MCP clients:** using Windows guests through MCP means running the MCP client elevated, so everything that client does runs with administrator rights. Use a separate elevated client session only for Windows-guest work.
+- **Killed MCP server:** if the server process is killed instead of stopped, its sessions keep running until their hard timeout (default 30 minutes; use a shorter `timeout` for agent sessions) or until `fc.ps1 cleanup`.
+- **Guest output airlock:** the only host code that reads data derived from guest output is `fc-airlock unpack`. It parses a small manifest (JSON) and copies byte ranges, in a memory-safe language, without admin or root rights, after the riskier archive parsing already ran inside a throwaway airlock VM. An attacker would need to compromise the airlock and then this reader. Each collection with output costs one more VM boot (about 1.5-8 s for Linux, about 3.5-5 s for Windows). The Windows link check before the copy relies on the guest's answer; a guest that hides a link only gets its own files collected, within the limits.
 - **Linux (Firecracker + jailer):** Firecracker with the jailer provides strong isolation but is not a guarantee against KVM or Firecracker escape vulnerabilities. A successful escape would land in the `fc-host` WSL VM, which can access Windows drives through `/mnt/c`. For high-risk samples, set `[automount] enabled=false` in `fc-host`'s `/etc/wsl.conf`. Results then stay in `/var/lib/fc-sandbox/results` inside the distro, and `fc.ps1` (which runs scripts from `/mnt/c`) is unavailable until automount is re-enabled.
 - **Windows (Hyper-V Utility VM):** Every Windows guest runs with `--isolation=hyperv` inside a dedicated Hyper-V Utility VM (`vmwp.exe`) with its own Windows kernel, and files are streamed in and out via `tar.exe` over `HVSocket` rather than mounting a writable host directory. It does not defend against Hyper-V (`vmwp.exe` / VMBus) escape vulnerabilities. Compared with the Linux path there is one layer fewer (no surrounding WSL VM), and the host components that carry guest exec traffic (`vmcompute.exe`, `dockerd.exe`) run as `SYSTEM`.
 - **Windows networked mode is enforced by the egress proxy, not by Windows networking.** Windows 11 accepts HNS endpoint ACLs on NAT networks but doesn't enforce them, and Windows Firewall rules don't reliably filter traffic forwarded from containers. An earlier HNS-based design let guests reach the LAN and host services. The proxy is the only new host code that reads guest data: it parses fixed-size binary frames (no HTTP), limits frame size, stream count and idle time, and runs without admin rights. It sees only TCP connection requests, not traffic inside TLS.
@@ -307,6 +386,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\smoke-win\all.ps1 -W
 
 # Egress proxy / relay unit and integration tests (no VM or elevation needed; .NET 10 SDK)
 dotnet test windows\egress
+
+# Guest output airlock tool unit tests
+dotnet test airlock
+
+# MCP server unit tests; FC_MCP_INTEGRATION=1 also runs the tools against real Linux VMs
+dotnet test mcp
+$env:FC_MCP_INTEGRATION = '1'; dotnet test mcp
+
+# MCP server end to end over stdio (add -Guest windows in an elevated prompt)
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\smoke-mcp\mcp.ps1
 ```
 
 The Linux suite must run inside the provisioned `fc-host` distro as root. It checks that first: anywhere else (Git Bash, another distro, a non-root user, or before `.\fc.ps1 setup`) it lists what is missing and exits 125 without reporting any check results. A single part, such as `tests/smoke/net.sh`, can be run the same way. The suite tests the controller installed in `/opt/fc-sandbox`, so after changing anything under `host\`, re-run `.\fc.ps1 setup` before testing.

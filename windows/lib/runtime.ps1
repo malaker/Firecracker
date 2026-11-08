@@ -17,9 +17,19 @@ using System.Threading;
 public static class FcProc
 {
     public const int TimedOut = int.MinValue;
+    // RunCapped only: stdout went past stdoutMax bytes; the process was killed.
+    public const int CapExceeded = int.MinValue + 1;
 
     public static int Run(string exe, string args, string stdinFile, string stdoutFile,
                           string stderrFile, bool echo, int timeoutMs)
+    {
+        return RunCapped(exe, args, stdinFile, stdoutFile, stderrFile, echo, timeoutMs, -1);
+    }
+
+    // Like Run, but stops writing stdout after stdoutMax bytes (+1, so the caller sees the cap
+    // was passed) and kills the process. stdoutMax < 0 means no cap.
+    public static int RunCapped(string exe, string args, string stdinFile, string stdoutFile,
+                                string stderrFile, bool echo, int timeoutMs, long stdoutMax)
     {
         // PowerShell passes an omitted [string] parameter as "", not null.
         if (string.IsNullOrEmpty(stdinFile)) stdinFile = null;
@@ -46,8 +56,9 @@ public static class FcProc
 
         using (var p = started)
         {
-            Thread tOut = Pump(p.StandardOutput.BaseStream, stdoutFile, echo ? Console.OpenStandardOutput() : null);
-            Thread tErr = Pump(p.StandardError.BaseStream, stderrFile, echo ? Console.OpenStandardError() : null);
+            var capHit = new ManualResetEvent(false);
+            Thread tOut = Pump(p.StandardOutput.BaseStream, stdoutFile, echo ? Console.OpenStandardOutput() : null, stdoutMax, capHit);
+            Thread tErr = Pump(p.StandardError.BaseStream, stderrFile, echo ? Console.OpenStandardError() : null, -1, null);
             if (stdinFile != null)
             {
                 var tIn = new Thread(() =>
@@ -59,29 +70,54 @@ public static class FcProc
                 tIn.IsBackground = true;
                 tIn.Start();
             }
-            bool exited = p.WaitForExit(timeoutMs < 0 ? -1 : timeoutMs);
-            if (!exited)
+            bool exited;
+            if (stdoutMax < 0)
+            {
+                exited = p.WaitForExit(timeoutMs < 0 ? -1 : timeoutMs);
+            }
+            else
+            {
+                // Wake up when the process exits or stdout passes the cap, whichever is first.
+                var deadline = timeoutMs < 0 ? DateTime.MaxValue : DateTime.UtcNow.AddMilliseconds(timeoutMs);
+                exited = false;
+                while (!capHit.WaitOne(0) && DateTime.UtcNow < deadline)
+                {
+                    if (p.WaitForExit(200)) { exited = true; break; }
+                }
+            }
+            bool capped = capHit.WaitOne(0);
+            if (!exited || capped)
             {
                 try { p.Kill(); } catch (InvalidOperationException) { }
                 p.WaitForExit(5000);
             }
             tOut.Join(5000);
             tErr.Join(5000);
+            if (capHit.WaitOne(0)) return CapExceeded;
             return exited ? p.ExitCode : TimedOut;
         }
     }
 
-    static Thread Pump(Stream src, string file, Stream echo)
+    static Thread Pump(Stream src, string file, Stream echo, long max, ManualResetEvent capHit)
     {
         var t = new Thread(() =>
         {
             FileStream fs = file != null ? new FileStream(file, FileMode.Create, FileAccess.Write, FileShare.Read) : null;
             try
             {
-                var buf = new byte[8192];
+                var buf = new byte[81920];
                 int n;
+                long total = 0;
                 while ((n = src.Read(buf, 0, buf.Length)) > 0)
                 {
+                    if (max >= 0 && total + n > max)
+                    {
+                        int keep = (int)Math.Min(n, max + 1 - total);
+                        if (fs != null && keep > 0) fs.Write(buf, 0, keep);
+                        capHit.Set();
+                        break;
+                    }
+                    total += n;
                     if (fs != null) { fs.Write(buf, 0, n); fs.Flush(); }
                     if (echo != null) { echo.Write(buf, 0, n); echo.Flush(); }
                 }
@@ -355,19 +391,27 @@ function Invoke-FcRuntimeProcess {
         [string]$StdoutFile,
         [string]$StderrFile,
         [switch]$Echo,
-        [int]$TimeoutSec = 0
+        [int]$TimeoutSec = 0,
+        # Stop and kill once stdout passes this many bytes; returns [FcProc]::CapExceeded.
+        [long]$StdoutMaxBytes = -1
     )
     $timeoutMs = if ($TimeoutSec -gt 0) { $TimeoutSec * 1000 } else { -1 }
-    return [FcProc]::Run((Get-FcCli $WinRuntime), (ConvertTo-FcArgString $ArgList),
-        $StdinFile, $StdoutFile, $StderrFile, [bool]$Echo, $timeoutMs)
+    return [FcProc]::RunCapped((Get-FcCli $WinRuntime), (ConvertTo-FcArgString $ArgList),
+        $StdinFile, $StdoutFile, $StderrFile, [bool]$Echo, $timeoutMs, $StdoutMaxBytes)
 }
 
 # Copies the contents of a host directory into a guest directory by streaming a
 # tar archive over the runtime's exec channel (HVSocket). No host share is mounted.
+# SourceDir may also be a single file, which lands in GuestDir under its own name.
 function Send-FcWinGuestFiles([string]$RunId, [string]$WinRuntime, [string]$SourceDir, [string]$GuestDir) {
     $tmp = [System.IO.Path]::GetTempFileName()
     try {
-        $tarRes = Invoke-FcNative -Exe $script:HOST_TAR -ArgList @('-cf', $tmp, '-C', $SourceDir, '.')
+        $what = if (Test-Path -LiteralPath $SourceDir -PathType Leaf) {
+            @('-C', (Split-Path -Parent $SourceDir), (Split-Path -Leaf $SourceDir))
+        } else {
+            @('-C', $SourceDir, '.')
+        }
+        $tarRes = Invoke-FcNative -Exe $script:HOST_TAR -ArgList (@('-cf', $tmp) + $what)
         if ($tarRes.ExitCode -ne 0) { throw "Failed to archive '$SourceDir': $($tarRes.Output)" }
         $errLog = "$tmp.err"
         $rc = Invoke-FcRuntimeProcess -WinRuntime $WinRuntime -StdinFile $tmp -StderrFile $errLog -TimeoutSec $script:COLLECT_TIMEOUT_SEC -ArgList @(
@@ -407,7 +451,9 @@ function Invoke-FcWinGuestCommand {
         [Parameter(Mandatory = $true)][string]$CommandText,
         [string]$StdoutPath,
         [string]$StderrPath,
-        [int]$TimeoutSec = 0
+        [int]$TimeoutSec = 0,
+        # Do not echo the guest's output to the console (internal probes).
+        [switch]$Quiet
     )
     $staging = Join-Path ([System.IO.Path]::GetTempPath()) "fc-win-$RunId-$([guid]::NewGuid().ToString('N'))"
     New-Item -ItemType Directory -Force -Path $staging | Out-Null
@@ -429,7 +475,7 @@ function Invoke-FcWinGuestCommand {
         $errFile = $tmpErr
     }
     try {
-        $rc = Invoke-FcRuntimeProcess -WinRuntime $WinRuntime -StdoutFile $StdoutPath -StderrFile $errFile -Echo -TimeoutSec $TimeoutSec -ArgList (
+        $rc = Invoke-FcRuntimeProcess -WinRuntime $WinRuntime -StdoutFile $StdoutPath -StderrFile $errFile -Echo:(-not $Quiet) -TimeoutSec $TimeoutSec -ArgList (
             @('exec', '-u', $script:GUEST_USER, '-w', 'C:\work') + (Get-FcWinGuestEnvArgs $RunId) +
             @((Get-FcContainerName $RunId), 'cmd.exe', '/S', '/C', "C:\work\.fc\$scriptName"))
         if ($rc -eq [FcProc]::TimedOut) {

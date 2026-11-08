@@ -22,7 +22,11 @@ param(
     [string]$Timeout = '30m',
     [switch]$Keep,
     [switch]$Boot,
-    [string]$ResultsDir
+    [string]$ResultsDir,
+    # run: write {"run_id","results_dir"} here as soon as the VM has an id (used by the MCP server).
+    [string]$RunInfoFile,
+    # put: guest folder (default C:\work\in). get: host folder (must not exist or be empty).
+    [string]$Dest
 )
 
 $ErrorActionPreference = 'Stop'
@@ -32,6 +36,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'lib\runtime.ps1')
 . (Join-Path $PSScriptRoot 'lib\egress.ps1')
 . (Join-Path $PSScriptRoot 'lib\net.ps1')
+. (Join-Path $PSScriptRoot 'lib\airlock.ps1')
 . (Join-Path $PSScriptRoot 'lib\doctor.ps1')
 
 $cfg = Get-FcWinConfig
@@ -54,6 +59,12 @@ Commands:
   shell [vm options]         Boot a VM and open an interactive root / ContainerAdministrator shell
   start [vm options]         Boot a VM in the background and print its run id
   ssh <run-id> [command]     Open a shell or run a command in a started VM
+  put <run-id> <host-path> [-Dest <guest-dir>]
+                             Copy a host file, or a folder's contents, into a started VM
+                             (default /work/in or C:\work\in)
+  get <run-id> <guest-path> [-Dest <host-dir>]
+                             Copy a guest file or folder out of a started VM through the guest
+                             output airlock (default runs\<run-id>\files; exit 1 if refused)
   list                       List VMs (running, dead or kept)
   stop <run-id>              Destroy a VM (and kept disk/container)
   cleanup                    Destroy every VM and remove all leftovers
@@ -116,14 +127,28 @@ function Complete-FcWinRunResults {
     )
     $outFilesDir = Join-Path $OutRunDir 'out'
     New-Item -ItemType Directory -Force -Path $outFilesDir | Out-Null
-    try {
-        if (Test-FcWinMicroVmRunning $RunId $WinRuntime) {
-            Receive-FcWinGuestFiles -RunId $RunId -WinRuntime $WinRuntime -GuestDir 'C:\work\out' -DestDir $outFilesDir
-        }
-    } catch {}
+    # Captured now: the VM (and its state) is released as soon as its output is on the host.
+    $vmMeta = Get-FcWinVmMeta $RunId
+    # Output leaves the guest only through the airlock (spec: guest-output-airlock). A refused
+    # collection keeps the exit code and is recorded in meta.json.
+    if (Test-FcWinMicroVmRunning $RunId $WinRuntime) {
+        $c = Invoke-FcWinAirlockTransfer -SrcRunId $RunId -WinRuntime $WinRuntime -GuestPath 'C:\work\out' -DestDir $outFilesDir `
+            -AfterPull { Remove-FcWinVmInstance -RunId $RunId -ForceDeleteKeep $false }
+        New-Item -ItemType Directory -Force -Path $outFilesDir | Out-Null
+    } else {
+        $c = New-FcWinAirlockResult failed 'the VM was no longer running when its output was collected'
+        Write-FcLog "collection failed: $($c.Reason)"
+    }
+    $collection = [ordered]@{
+        status = $c.Status
+        reason = $(if ($c.Reason) { $c.Reason } else { $null })
+        files  = $c.Files
+        bytes  = $c.Bytes
+    }
     Write-FcTextFile -Path (Join-Path $OutRunDir 'exit_code') -Text "$ExitCode`n"
     Write-FcWinRunResultMeta -ResultsDir $OutRunDir -RunId $RunId -CommandText $CommandText `
-        -PayloadPath $PayloadPath -ExitCode $ExitCode -TimedOut $TimedOut -ErrorMessage $ErrorMessage
+        -PayloadPath $PayloadPath -ExitCode $ExitCode -TimedOut $TimedOut -ErrorMessage $ErrorMessage `
+        -Collection $collection -VmMeta $vmMeta
 }
 
 function Remove-FcWinVmInstance([string]$RunId, [bool]$ForceDeleteKeep = $false) {
@@ -154,37 +179,65 @@ function Remove-FcWinVmInstance([string]$RunId, [bool]$ForceDeleteKeep = $false)
     }
 }
 
-function Start-NewFcWinVm([int]$LifetimeSec) {
+# A started VM that put/get may use: exists, running, and not an airlock. Returns its id.
+function Assert-FcWinSessionVm([string]$Id) {
     Assert-FcAdmin
-    try {
-        Assert-ValidResources -Vcpu $Vcpu -MemMib $MemMib
-    } catch {
-        Stop-FcWithError $_.Exception.Message $script:EXIT_INFRA
-    }
+    if (-not $Id -or -not (Test-FcWinVmExists $Id)) { Stop-FcWithError "No running Windows microVM '$Id'" $script:EXIT_INFRA }
+    $m = Get-FcWinVmMeta $Id
+    if (-not (Test-FcWinMicroVmRunning $Id ([string]$m.win_runtime))) { Stop-FcWithError "Windows microVM '$Id' is not running" $script:EXIT_INFRA }
+    if ($m.PSObject.Properties['role'] -and $m.role -eq 'airlock') { Stop-FcWithError "Windows microVM '$Id' is an airlock" $script:EXIT_INFRA }
+    return $Id
+}
 
-    if (-not (Test-FcWinRuntimeReady $WinRuntime)) {
-        Stop-FcWithError "Windows runtime '$WinRuntime' is not running; run '.\fc.ps1 doctor -Guest windows'." $script:EXIT_INFRA
+# Destroys a VM unless it is already gone or kept (e.g. released by output collection).
+function Remove-FcWinVmIfActive([string]$RunId) {
+    $m = Get-FcWinVmMeta $RunId
+    if ($m -and [string]$m.state -ne 'kept') { Remove-FcWinVmInstance -RunId $RunId -ForceDeleteKeep $false }
+}
+
+# Boots a Windows microVM with explicit settings and returns its run id. Throws on failure
+# (after removing what it started), so callers that must survive a failed boot - the guest
+# output airlock - can. role is 'vm' or 'airlock'; an airlock records the run it serves.
+function Start-FcWinVmCore {
+    param(
+        [Parameter(Mandatory = $true)][string]$VmRuntime,
+        [Parameter(Mandatory = $true)][string]$VmImageRepo,
+        [Parameter(Mandatory = $true)][string]$VmFlavour,
+        [Parameter(Mandatory = $true)][int]$VmVcpu,
+        [Parameter(Mandatory = $true)][int]$VmMemMib,
+        [Parameter(Mandatory = $true)][string]$VmNet,
+        [string]$VmAllowCsv = '',
+        [Parameter(Mandatory = $true)][int]$VmTimeoutSec,
+        [Parameter(Mandatory = $true)][int]$LifetimeSec,
+        [bool]$VmKeep = $false,
+        [string]$Role = 'vm',
+        [string]$Parent = ''
+    )
+    Assert-ValidResources -Vcpu $VmVcpu -MemMib $VmMemMib
+    if (-not (Test-FcWinRuntimeReady $VmRuntime)) {
+        throw "Windows runtime '$VmRuntime' is not running; run '.\fc.ps1 doctor -Guest windows'."
     }
 
     $runId    = New-FcRunId
-    $imageRef = Get-FcImageReference $ImageRepo $Flavour
+    $imageRef = Get-FcImageReference $VmImageRepo $VmFlavour
 
-    $startedAt = Get-IsoTimestamp
     $initialMeta = [ordered]@{
         run_id       = $runId
         guest        = 'windows'
         state        = 'running'
-        flavour      = $Flavour
-        image_repo   = $ImageRepo
-        win_runtime  = $WinRuntime
-        net          = $Net
-        allow        = $allowCsv
-        vcpu         = $Vcpu
-        mem_mib      = $MemMib
-        timeout_sec  = $timeoutSec
+        role         = $Role
+        parent       = $(if ($Parent) { $Parent } else { $null })
+        flavour      = $VmFlavour
+        image_repo   = $VmImageRepo
+        win_runtime  = $VmRuntime
+        net          = $VmNet
+        allow        = $VmAllowCsv
+        vcpu         = $VmVcpu
+        mem_mib      = $VmMemMib
+        timeout_sec  = $VmTimeoutSec
         lifetime_sec = $LifetimeSec
-        started_at   = $startedAt
-        keep_disk    = [bool]$Keep
+        started_at   = (Get-IsoTimestamp)
+        keep_disk    = $VmKeep
         results_dir  = ''
         watchdog_pid = $null
         container_id = ''
@@ -193,28 +246,41 @@ function Start-NewFcWinVm([int]$LifetimeSec) {
     }
     Save-FcWinVmMeta -RunId $runId -MetaObj $initialMeta
 
-    Write-FcLog "Starting Windows microVM $runId (flavour=$Flavour runtime=$WinRuntime net=$Net vcpu=$Vcpu mem=${MemMib}MiB timeout=${timeoutSec}s)"
+    $what = if ($Role -eq 'airlock') { "airlock for $Parent" } else { 'microVM' }
+    Write-FcLog "Starting Windows $what $runId (flavour=$VmFlavour runtime=$VmRuntime net=$VmNet vcpu=$VmVcpu mem=${VmMemMib}MiB timeout=${VmTimeoutSec}s)"
     try {
         # Arm the watchdog before the Utility VM exists so a controller crash at any
         # later step still ends the VM on time (teardown falls back to the container name).
         Start-FcWinWatchdog -RunId $runId -LifetimeSec $LifetimeSec -ControllerScriptPath $PSCommandPath
-        $started = Start-FcWinMicroVm -RunId $runId -WinRuntime $WinRuntime -ImageRef $imageRef `
-            -Vcpu $Vcpu -MemMib $MemMib -NetMode $Net
+        $started = Start-FcWinMicroVm -RunId $runId -WinRuntime $VmRuntime -ImageRef $imageRef `
+            -Vcpu $VmVcpu -MemMib $VmMemMib -NetMode $VmNet
         Set-FcWinVmMetaProperty -RunId $runId -Key 'container_id' -Value $started.ContainerId
 
         # The guest has no network adapter in either mode. Networked mode starts the egress
         # proxy and waits until it answers inside the guest, BEFORE the image entrypoint or payload.
-        Set-FcWinVmNetworkPolicy -RunId $runId -WinRuntime $WinRuntime -NetMode $Net `
-            -AllowCsv $allowCsv -Flavour $Flavour
+        Set-FcWinVmNetworkPolicy -RunId $runId -WinRuntime $VmRuntime -NetMode $VmNet `
+            -AllowCsv $VmAllowCsv -Flavour $VmFlavour
 
-        if (Test-IsIisFlavour $Flavour) {
-            Start-FcWinImageEntrypoint -RunId $runId -WinRuntime $WinRuntime -ImageRef $imageRef
+        if ($Role -ne 'airlock' -and (Test-IsIisFlavour $VmFlavour)) {
+            Start-FcWinImageEntrypoint -RunId $runId -WinRuntime $VmRuntime -ImageRef $imageRef
         }
-
         return $runId
     } catch {
+        $msg = $_.Exception.Message
         Remove-FcWinVmInstance -RunId $runId -ForceDeleteKeep $true
-        Stop-FcWithError "Windows microVM $runId failed to start: $($_.Exception.Message)" $script:EXIT_INFRA
+        throw "Windows $what $runId failed to start: $msg"
+    }
+}
+
+# Boots a VM with the command-line options; exits the controller on failure.
+function Start-NewFcWinVm([int]$LifetimeSec) {
+    Assert-FcAdmin
+    try {
+        return Start-FcWinVmCore -VmRuntime $WinRuntime -VmImageRepo $ImageRepo -VmFlavour $Flavour `
+            -VmVcpu $Vcpu -VmMemMib $MemMib -VmNet $Net -VmAllowCsv $allowCsv -VmTimeoutSec $timeoutSec `
+            -LifetimeSec $LifetimeSec -VmKeep ([bool]$Keep)
+    } catch {
+        Stop-FcWithError $_.Exception.Message $script:EXIT_INFRA
     }
 }
 
@@ -235,6 +301,15 @@ switch ($Command) {
         $runId       = Start-NewFcWinVm ($timeoutSec + $script:COLLECT_GRACE_SEC)
         $outRunDir   = Join-Path $ResultsDir $runId
         New-Item -ItemType Directory -Force -Path (Join-Path $outRunDir 'out') | Out-Null
+        if ($RunInfoFile) {
+            try {
+                $info = [ordered]@{ run_id = $runId; results_dir = $outRunDir } | ConvertTo-Json -Compress
+                [System.IO.File]::WriteAllText("$RunInfoFile.tmp", $info)
+                Move-Item -LiteralPath "$RunInfoFile.tmp" -Destination $RunInfoFile -Force
+            } catch {
+                Write-FcLog "warning: could not write the run info file ${RunInfoFile}: $($_.Exception.Message)"
+            }
+        }
 
         Write-FcWinRunResultMeta -ResultsDir $outRunDir -RunId $runId -CommandText $Cmd -PayloadPath $payloadFull
         Set-FcWinVmMetaProperty -RunId $runId -Key 'results_dir' -Value $outRunDir
@@ -263,7 +338,8 @@ switch ($Command) {
         } finally {
             Complete-FcWinRunResults -RunId $runId -WinRuntime $WinRuntime -OutRunDir $outRunDir `
                 -CommandText $Cmd -PayloadPath $payloadFull -ExitCode $rc -TimedOut $timedOut -ErrorMessage $errMsg
-            Remove-FcWinVmInstance -RunId $runId -ForceDeleteKeep $false
+            # Collection already released the VM once its output was pulled.
+            Remove-FcWinVmIfActive $runId
         }
         if ($errMsg) { Write-FcLog "error: $errMsg" }
         Write-FcLog "results: $outRunDir (exit code $rc)"
@@ -307,9 +383,42 @@ switch ($Command) {
         }
     }
 
+    'put' {
+        $id = Assert-FcWinSessionVm $(if ($Rest -and $Rest.Count -ge 1) { $Rest[0] } else { '' })
+        $src = if ($Rest -and $Rest.Count -ge 2) { $Rest[1] } else { '' }
+        if (-not $src -or -not (Test-Path -LiteralPath $src)) { Stop-FcWithError "Host path '$src' not found." $script:EXIT_INFRA }
+        $guestDir = if ($Dest) { $Dest } else { 'C:\work\in' }
+        if ($guestDir -match '["%!\r\n]') { Stop-FcWithError "Unsupported characters in guest folder '$guestDir'." $script:EXIT_INFRA }
+        $rt = [string](Get-FcWinVmMeta $id).win_runtime
+        try {
+            $mk = Invoke-FcWinGuestCommand -RunId $id -WinRuntime $rt -Quiet -TimeoutSec 60 -CommandText "if not exist `"$guestDir\`" mkdir `"$guestDir`""
+            if ($mk.ExitCode -ne 0) { throw "could not create $guestDir in the guest" }
+            Send-FcWinGuestFiles -RunId $id -WinRuntime $rt -SourceDir (Resolve-Path -LiteralPath $src).Path -GuestDir $guestDir
+        } catch {
+            Stop-FcWithError "Copy into ${guestDir} failed: $($_.Exception.Message)" $script:EXIT_INFRA
+        }
+        Write-FcLog "Copied $src into $guestDir"
+        exit 0
+    }
+
+    'get' {
+        $id = Assert-FcWinSessionVm $(if ($Rest -and $Rest.Count -ge 1) { $Rest[0] } else { '' })
+        $guestPath = if ($Rest -and $Rest.Count -ge 2) { $Rest[1] } else { '' }
+        if (-not $guestPath) { Stop-FcWithError "get needs a guest path" $script:EXIT_INFRA }
+        if (-not $Dest) { Stop-FcWithError "get needs -Dest <host folder>" $script:EXIT_INFRA }
+        $rt = [string](Get-FcWinVmMeta $id).win_runtime
+        $r = Invoke-FcWinAirlockTransfer -SrcRunId $id -WinRuntime $rt -GuestPath $guestPath -DestDir $Dest -MissingIsError
+        if ($r.Status -eq 'ok') {
+            Write-FcLog "Copied $($r.Files) files ($($r.Bytes) bytes) from $guestPath to $Dest"
+            exit 0
+        }
+        if ($r.Status -eq 'refused' -or $r.Reason -like 'guest path *') { exit 1 }
+        exit $script:EXIT_INFRA
+    }
+
     'list' {
-        $fmt = "{0,-22} {1,-8} {2,-16} {3,-10} {4,-5} {5,-7} {6,-20} {7}"
-        Write-Output ($fmt -f 'RUN-ID', 'STATE', 'FLAVOUR', 'NET', 'VCPU', 'MEM', 'STARTED', 'ALLOW')
+        $fmt ="{0,-22} {1,-8} {2,-16} {3,-10} {4,-5} {5,-7} {6,-20} {7,-18} {8}"
+        Write-Output ($fmt -f 'RUN-ID', 'STATE', 'FLAVOUR', 'NET', 'VCPU', 'MEM', 'STARTED', 'ALLOW', 'ROLE')
         foreach ($id in (Get-FcWinVmIds)) {
             $m = Get-FcWinVmMeta $id
             if (-not $m) { continue }
@@ -317,7 +426,9 @@ switch ($Command) {
             if ($state -ne 'kept' -and -not (Test-FcWinMicroVmRunning $id $m.win_runtime)) {
                 $state = 'dead'
             }
-            Write-Output ($fmt -f $id, $state, $m.flavour, $m.net, $m.vcpu, "$($m.mem_mib)M", $m.started_at, $m.allow)
+            $role = if ($m.PSObject.Properties['role'] -and $m.role -eq 'airlock') { "airlock:$($m.parent)" } else { 'vm' }
+            $allowShown = if ($m.allow) { $m.allow } else { '-' }
+            Write-Output ($fmt -f $id, $state, $m.flavour, $m.net, $m.vcpu, "$($m.mem_mib)M", $m.started_at, $allowShown, $role)
         }
         exit 0
     }
@@ -354,6 +465,11 @@ switch ($Command) {
         }
         Stop-FcWinOrphanEgress
         Clear-AllFcWinNetworkPolicies
+        # Airlock leftovers: a host-side check still running and transfer staging folders.
+        # (Airlock VMs themselves are ordinary VMs and were destroyed above.)
+        Get-Process -Name 'fc-airlock' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Get-ChildItem -LiteralPath ([System.IO.Path]::GetTempPath()) -Directory -Filter 'fc-airlock-*' -Force -ErrorAction SilentlyContinue |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
         $vmsDir = Get-FcWinVmsDir
         if (Test-Path -LiteralPath $vmsDir) {
             Get-ChildItem -LiteralPath $vmsDir -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
@@ -383,7 +499,7 @@ switch ($Command) {
                 } catch {}
             }
         }
-        Remove-FcWinVmInstance -RunId $id -ForceDeleteKeep $false
+        Remove-FcWinVmIfActive $id
         exit 0
     }
 
