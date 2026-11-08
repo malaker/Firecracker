@@ -9,14 +9,14 @@
 
 ## 2. CLI file transfer for started VMs (Windows backend)
 
-- [ ] 2.1 Generalise `Send-FcWinGuestFiles` in `windows/lib/runtime.ps1` for single files (put direction), and confirm the Windows airlock transfer entry point from `guest-output-airlock` handles single guest files and folders for `get`; verify by putting a single file and getting it back through the airlock
-- [ ] 2.2 Add `put` and `get` cases to `windows/fcctl-win.ps1` and its usage text, and pass `-Dest` through `fc.ps1`; verify round-trip against a `start -Guest windows` VM in an elevated prompt
-- [ ] 2.3 Add `tests/smoke-win/files.ps1` covering the same cases as 1.4 and call it from `tests/smoke-win/all.ps1`; verify the Windows smoke suite passes on the docker runtime and, where supported, containerd
-- [ ] 2.4 Document `put` and `get` in `README.md` (command list, defaults, contained extraction) and in both usage texts; verify the documented examples run as written
+- [x] 2.1 Generalise `Send-FcWinGuestFiles` in `windows/lib/runtime.ps1` for single files (put direction), and confirm the Windows airlock transfer entry point from `guest-output-airlock` handles single guest files and folders for `get`; verify by putting a single file and getting it back through the airlock
+- [x] 2.2 Add `put` and `get` cases to `windows/fcctl-win.ps1` and its usage text, and pass `-Dest` through `fc.ps1`; verify round-trip against a `start -Guest windows` VM in an elevated prompt
+- [x] 2.3 Add `tests/smoke-win/files.ps1` covering the same cases as 1.4 and call it from `tests/smoke-win/all.ps1`; verify the Windows smoke suite passes on the docker runtime and, where supported, containerd
+- [x] 2.4 Document `put` and `get` in `README.md` (command list, defaults, contained extraction) and in both usage texts; verify the documented examples run as written
 
 ## 3. Run info file for `run`
 
-- [ ] 3.1 Add optional `--run-info-file` to `fcctl run` and `-RunInfoFile` to `fcctl-win.ps1 run`, writing `{"run_id","results_dir"}` (Windows path) as soon as the VM has an id, and pass it through `fc.ps1`; verify the file appears during a run on both guests and that runs without it behave as before
+- [x] 3.1 Add optional `--run-info-file` to `fcctl run` and `-RunInfoFile` to `fcctl-win.ps1 run`, writing `{"run_id","results_dir"}` (Windows path) as soon as the VM has an id, and pass it through `fc.ps1`; verify the file appears during a run on both guests and that runs without it behave as before
 
 ## 4. MCP server scaffolding and build
 
@@ -37,7 +37,7 @@
 - [x] 6.1 Implement `sandbox_run` on top of `run -RunInfoFile`, returning run id, exit code, timeout flag, shaped stdout/stderr, result folder and output file list; verify an integration test against a real Linux VM using `samples/hello`
 - [x] 6.2 Implement `sandbox_start`, `sandbox_exec` (Linux `cd /work &&` prefix, per-exec logs under `runs/<session-id>/exec/<n>/`, exec timeout), `sandbox_list` and `sandbox_stop`; verify an integration test that state persists between execs and a stopped session is rejected
 - [x] 6.3 Implement `sandbox_put` and `sandbox_get` on the CLI commands from groups 1-2, with confinement on put and the fixed `runs/<session-id>/files/` destination on get; verify an integration test that round-trips a file and refuses a path outside the root
-- [ ] 6.4 Add a stdio end-to-end smoke script `tests/smoke-mcp/mcp.ps1` that launches `fc.ps1 mcp`, sends `initialize`, `tools/list` (asserting exactly the seven tools), a `sandbox_run`, and a session round-trip, then closes stdin and asserts no VMs remain via `fc.ps1 list`; verify it passes for Linux guests and, from an elevated prompt, Windows guests
+- [x] 6.4 Add a stdio end-to-end smoke script `tests/smoke-mcp/mcp.ps1` that launches `fc.ps1 mcp`, sends `initialize`, `tools/list` (asserting exactly the seven tools), a `sandbox_run`, and a session round-trip, then closes stdin and asserts no VMs remain via `fc.ps1 list`; verify it passes for Linux guests and, from an elevated prompt, Windows guests
 
 ## 7. Documentation
 
