@@ -1,11 +1,23 @@
 #!/usr/bin/env bash
 # Provision the fc-host WSL distro (run as root, idempotent).
-# Usage: provision.sh <repo-dir> [airlock-build-dir]
-#   airlock-build-dir holds the linux-x64 fc-airlock published by airlock/install-airlock.ps1.
+# Usage: provision.sh <repo-dir> [airlock-build-dir] [gateway-build-dir] [--no-agent-image] [--ollama-url URL]
+#   airlock-build-dir holds the linux-x64 fc-airlock published by airlock/install-airlock.ps1,
+#   gateway-build-dir the linux-x64 fc-llm-gateway published by gateway/install-gateway.ps1.
 set -euo pipefail
 
 REPO="$(cd "$1" && pwd)"
 AIRLOCK_BUILD="${2:-}"
+GATEWAY_BUILD="${3:-}"
+NO_AGENT_IMAGE=0 OLLAMA_URL=""
+shift $(( $# < 3 ? $# : 3 ))
+while (( $# )); do
+  case "$1" in
+    --no-agent-image) NO_AGENT_IMAGE=1 ;;
+    --ollama-url) OLLAMA_URL="${2:-}"; shift ;;
+    *) echo "provision.sh: unknown option '$1'" >&2; exit 2 ;;
+  esac
+  shift
+done
 FC_HOME=/opt/fc-sandbox
 CACHE=/var/cache/fc-sandbox
 STATE=/var/lib/fc-sandbox
@@ -84,6 +96,27 @@ if [ ! -f "$FC_HOME/images/rootfs.ext4" ] || [ "$(cat "$FC_HOME/images/rootfs.ex
   changed "built base rootfs from $ROOTFS_NAME"
 fi
 
+# --- agent image (in-sandbox-agents) ----------------------------------------
+# Rebuilt when the base image, Node.js, the agent lockfile, the build script, the guest wrapper or
+# the size changes. A failed build (bad checksum, missing package) keeps the previous image.
+if (( NO_AGENT_IMAGE )); then
+  say "skipping the agent image (--no-agent-image); -Agent runs are unavailable"
+else
+  agent_stamp="$(cat "$FC_HOME/images/rootfs.ext4.stamp") $NODE_SHA256"
+  for f in images/agent/package-lock.json images/build-agent-rootfs.sh images/agent/fc-agent; do
+    agent_stamp+=" $(sha256sum < "$REPO/$f" | cut -c1-16)"
+  done
+  agent_stamp+=" $AGENT_ROOTFS_SIZE"
+  if [ ! -f "$FC_HOME/images/agent-rootfs.ext4" ] || [ "$(cat "$FC_HOME/images/agent-rootfs.ext4.stamp" 2>/dev/null)" != "$agent_stamp" ]; then
+    node="$(fetch "$NODE_URL" "$NODE_SHA256")"
+    changed "building the agent image (Node.js $NODE_VERSION + agent clients; downloads several hundred MB)"
+    bash "$REPO/images/build-agent-rootfs.sh" "$FC_HOME/images/rootfs.ext4" "$node" "$REPO/images/agent" \
+      "$FC_HOME/images/agent-rootfs.ext4" "$AGENT_ROOTFS_SIZE"
+    echo "$agent_stamp" > "$FC_HOME/images/agent-rootfs.ext4.stamp"
+    changed "built agent image"
+  fi
+fi
+
 # --- controller -------------------------------------------------------------
 sync_file() {
   local src="$1" dst="$2" mode="$3"
@@ -104,6 +137,27 @@ else
 fi
 mkdir -p "$STATE/staging"
 chmod 0711 "$STATE/staging"
+
+# LLM gateway and agent profiles (spec: kvm-host-setup / Agent image and gateway build).
+mkdir -p "$FC_HOME/agents"
+sync_file "$REPO/host/agents/profiles.json" "$FC_HOME/agents/profiles.json" 0644
+if [ -n "$GATEWAY_BUILD" ]; then
+  [ -f "$GATEWAY_BUILD/fc-llm-gateway" ] || { say "error: $GATEWAY_BUILD/fc-llm-gateway not found"; exit 1; }
+  sync_file "$GATEWAY_BUILD/fc-llm-gateway" "$FC_HOME/bin/fc-llm-gateway" 0755
+else
+  say "warning: no gateway build given; run 'fc.ps1 setup' to install fc-llm-gateway"
+fi
+if [ -n "$OLLAMA_URL" ]; then
+  { printf 'FC_OLLAMA_URL=%q' "$OLLAMA_URL"; echo; } > "$FC_HOME/agents/local.env.tmp"
+  if ! cmp -s "$FC_HOME/agents/local.env.tmp" "$FC_HOME/agents/local.env"; then
+    mv "$FC_HOME/agents/local.env.tmp" "$FC_HOME/agents/local.env"; changed "set the Ollama URL to $OLLAMA_URL"
+  else
+    rm -f "$FC_HOME/agents/local.env.tmp"
+  fi
+fi
+# Stashed provider keys and per-VM gateway sockets (design D2/D5).
+install -d -m 0700 "$STATE/keys"
+install -d -m 0711 "$STATE/gw"
 
 # --- host settings ----------------------------------------------------------
 if [ ! -f /etc/sysctl.d/90-fc-sandbox.conf ]; then

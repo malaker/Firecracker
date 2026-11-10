@@ -24,6 +24,8 @@ _ssh_key()       { [ -f "$FC_SSH_KEY" ] && [ -f "$FC_SSH_KEY.pub" ]; }
 _tools()         { command -v jq && command -v socat && command -v ssh && command -v nft && command -v ip; }
 _disk()          { mkdir -p "$FC_JAIL_BASE"; (( $(df -Pk "$FC_JAIL_BASE" | awk 'NR==2 {print $4}') >= 4 * 1024 * 1024 )); }
 _mem()           { (( $(awk '/^MemAvailable:/ {print $2}' /proc/meminfo) >= 1536 * 1024 )); }
+_agent_image()   { [ -f "$FC_AGENT_ROOTFS" ] && [ -f "$FC_AGENT_ROOTFS.stamp" ]; }
+_gateway()       { [ -x "$FC_GATEWAY_BIN" ] && "$FC_GATEWAY_BIN" --version | grep -q '^fc-llm-gateway ' && [ -f "$FC_AGENTS/profiles.json" ]; }
 _airlock()       { [ -x "$FC_HOME/bin/fc-airlock" ] && "$FC_HOME/bin/fc-airlock" --version | grep -q '^fc-airlock '; }
 
 _boot() {
@@ -47,6 +49,16 @@ doctor() {
   check "base rootfs built from pinned image" "rerun 'fc.ps1 setup' to rebuild the base image" _rootfs_ok
   check "controller SSH key"              "rerun 'fc.ps1 setup'" _ssh_key
   check "guest output airlock tool (fc-airlock)" "rerun 'fc.ps1 setup' (needs the .NET 10 SDK)" _airlock
+  check "agent image (-Agent runs)"      "rerun 'fc.ps1 setup' (without -NoAgentImage)" _agent_image
+  check "LLM gateway (fc-llm-gateway)"    "rerun 'fc.ps1 setup' (needs the .NET 10 SDK)" _gateway
+  # Ollama is optional: only the codex-ollama profile needs it.
+  local ollama; ollama="$(agent_ollama_url)"
+  if [ -n "$ollama" ] && curl -fsS -m 3 -o /dev/null "$ollama/api/version" 2>/dev/null; then
+    echo "  [PASS] Ollama reachable at $ollama (codex-ollama profile)"
+  else
+    echo "  [WARN] Ollama not reachable at ${ollama:-<none>}; only the codex-ollama profile needs it"
+    echo "         hint: see README, \"Ollama\"; set the URL with fc.ps1 setup -OllamaUrl"
+  fi
   check "/dev/net/tun (networked mode)"   "the WSL kernel lacks TUN support; networked mode needs a custom WSL kernel" _tun
   check "nftables usable (networked mode)" "the WSL kernel lacks nf_tables; networked mode needs a custom WSL kernel" _nft
   check "cgroup v2 cpu+memory controllers" "enable systemd/cgroup v2 in the fc-host distro (/etc/wsl.conf [boot] systemd=true), then 'wsl --shutdown'" _cgroup2

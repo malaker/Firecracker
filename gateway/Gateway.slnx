@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="FcGateway/FcGateway.csproj" />
+  <Project Path="FcGateway.Tests/FcGateway.Tests.csproj" />
+</Solution>

@@ -11,6 +11,19 @@ function Expect([string]$Name, [bool]$Ok) {
 }
 
 Write-Host "== mcp ($Guest)"
+# Linux: an agent run against the smoke tests' fake provider (no real API). The server inherits
+# the test upstream (passed into WSL with WSLENV) and a fake key.
+$fakeProvider = $null
+$fpPort = 18092
+$fpLog = "/tmp/fc-mcp-smoke-fp-$([guid]::NewGuid().ToString('N')).jsonl"
+if ($Guest -eq 'linux') {
+    $repoWsl = '/mnt/' + $RepoRoot.Substring(0, 1).ToLowerInvariant() + $RepoRoot.Substring(2).Replace('\', '/')
+    $fakeProvider = Start-Process wsl.exe -ArgumentList @('-d', 'fc-host', '-u', 'root', '-e', 'python3', "$repoWsl/tests/smoke/fake-provider.py", "$fpPort", $fpLog) -WindowStyle Hidden -PassThru
+    Start-Sleep -Seconds 2
+    $env:FC_GATEWAY_TEST_UPSTREAM = "http://127.0.0.1:$fpPort"
+    $env:WSLENV = if ($env:WSLENV) { "$($env:WSLENV):FC_GATEWAY_TEST_UPSTREAM" } else { 'FC_GATEWAY_TEST_UPSTREAM' }
+    $env:ANTHROPIC_API_KEY = 'sk-mcp-smoke-fake'
+}
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = 'powershell.exe'
 $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$FcPs1`" mcp"
@@ -75,6 +88,17 @@ try {
     $net = Call-Tool 'sandbox_start' @{ net = 'networked' }
     Expect "networked mode is refused without -AllowNetworked" ($net.isError -eq $true -and $net.content[0].text -match 'networked mode is disabled')
 
+    $both = Call-Tool 'sandbox_run' @{ command = 'true'; agent = 'claude'; prompt = 'x' }
+    Expect "command and agent together are refused" ($both.isError -eq $true -and $both.content[0].text -match 'either command or agent')
+    if ($Guest -eq 'linux') {
+        $ag = Call-Tool 'sandbox_run' @{ agent = 'claude'; prompt = "Say hello; it's a `"test`""; timeout = '4m' }
+        $agS = $ag.structuredContent
+        Expect "agent run succeeds in gateway mode" ($ag.isError -ne $true -and $agS.exit_code -eq 0 -and $agS.agent.mode -eq 'gateway')
+        Expect "agent transcript has the provider's reply" ($agS.transcript_path -and (Select-String -LiteralPath $agS.transcript_path -SimpleMatch 'FAKE-PROVIDER-REPLY' -Quiet))
+        Expect "llm.log path is returned" ($agS.llm_log_path -and (Select-String -LiteralPath $agS.llm_log_path -SimpleMatch 'decision=forwarded' -Quiet))
+        Expect "agent run output is marked untrusted" ($ag.content[0].text -match 'untrusted output produced inside a sandbox VM')
+    }
+
     # Disconnect with the session still running: the server must destroy it before exiting.
     $stdin.Close()
     $exited = $server.WaitForExit(60000)
@@ -83,9 +107,14 @@ try {
     Expect "no session VM left after disconnect" (-not ($list -match [regex]::Escape($sid)))
 } finally {
     if (-not $server.HasExited) { $server.Kill() }
+    if ($fakeProvider) {
+        if (-not $fakeProvider.HasExited) { $fakeProvider.Kill() }
+        & wsl.exe -d fc-host -u root -e sh -c "pkill -f 'fake-provider.py $fpPort ' ; rm -f $fpLog" 2>$null | Out-Null
+    }
     $err = $errTask.Result
     if ($script:Fails) { Write-Host "server stderr:`n$err" }
 }
 
 if ($script:Fails) { Write-Host "mcp.ps1: $($script:Fails) check(s) failed"; exit 1 }
 Write-Host "mcp.ps1: all checks passed"
+exit 0

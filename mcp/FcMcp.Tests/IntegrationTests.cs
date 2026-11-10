@@ -117,4 +117,57 @@ public sealed class IntegrationTests : IDisposable
         Assert.Contains("symbolic link is not allowed", Text(link));
         Assert.Contains(OutputShaper.Notice, Text(link));
     }
+
+    /// <summary>
+    /// An agent run (Claude Code, gateway mode) against the local fake provider from the smoke tests,
+    /// reached through FC_GATEWAY_TEST_UPSTREAM (passed into WSL with WSLENV). No real API is used.
+    /// </summary>
+    [IntegrationFact]
+    public async Task AgentRunAgainstTheFakeProvider()
+    {
+        const int port = 18091;
+        string repoWsl = "/mnt/" + char.ToLowerInvariant(Repo[0]) + Repo[2..].Replace('\\', '/');
+        string fpLog = "/tmp/fc-mcp-fake-provider-" + Guid.NewGuid().ToString("N") + ".jsonl";
+        using var fp = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("wsl.exe")
+        {
+            ArgumentList = { "-d", "fc-host", "-u", "root", "-e", "python3", repoWsl + "/tests/smoke/fake-provider.py", port.ToString(), fpLog },
+            UseShellExecute = false, CreateNoWindow = true,
+        })!;
+        string? oldUp = Environment.GetEnvironmentVariable("FC_GATEWAY_TEST_UPSTREAM");
+        string? oldWslEnv = Environment.GetEnvironmentVariable("WSLENV");
+        string? oldKey = Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY");
+        try
+        {
+            await Task.Delay(2000);
+            Environment.SetEnvironmentVariable("FC_GATEWAY_TEST_UPSTREAM", $"http://127.0.0.1:{port}");
+            Environment.SetEnvironmentVariable("WSLENV", string.IsNullOrEmpty(oldWslEnv) ? "FC_GATEWAY_TEST_UPSTREAM" : oldWslEnv + ":FC_GATEWAY_TEST_UPSTREAM");
+            Environment.SetEnvironmentVariable("ANTHROPIC_API_KEY", "sk-mcp-integration-fake");
+
+            var r = await _tools.SandboxRun(agent: "claude", prompt: "Say hello; it's a \"test\"", timeout: "4m");
+            Assert.NotEqual(true, r.IsError);
+            var s = S(r);
+            Assert.Equal(0, s.GetProperty("exit_code").GetInt32());
+            var agent = s.GetProperty("agent");
+            Assert.Equal("claude", agent.GetProperty("profile").GetString());
+            Assert.Equal("gateway", agent.GetProperty("mode").GetString());
+            Assert.True(agent.GetProperty("requests").GetInt32() >= 1);
+            string transcript = s.GetProperty("transcript_path").GetString()!;
+            Assert.Contains("FAKE-PROVIDER-REPLY", File.ReadAllText(transcript));
+            Assert.Contains("decision=forwarded", File.ReadAllText(s.GetProperty("llm_log_path").GetString()!));
+            Assert.Contains(OutputShaper.Notice, Text(r));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("FC_GATEWAY_TEST_UPSTREAM", oldUp);
+            Environment.SetEnvironmentVariable("WSLENV", oldWslEnv);
+            Environment.SetEnvironmentVariable("ANTHROPIC_API_KEY", oldKey);
+            try { fp.Kill(entireProcessTree: true); } catch (InvalidOperationException) { }
+            using var kill = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("wsl.exe")
+            {
+                ArgumentList = { "-d", "fc-host", "-u", "root", "-e", "sh", "-c", $"pkill -f 'fake-provider.py {port} ' ; rm -f {fpLog}" },
+                UseShellExecute = false, CreateNoWindow = true,
+            })!;
+            kill.WaitForExit(10000);
+        }
+    }
 }

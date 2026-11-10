@@ -1,0 +1,9 @@
+{
+  "name": "fc-agent-clients",
+  "private": true,
+  "description": "Agent CLIs baked into the fc-sandbox agent image. Installed with npm ci --ignore-scripts from the committed lockfile; change a version only together with the lockfile.",
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.319",
+    "@openai/codex": "0.167.0"
+  }
+}

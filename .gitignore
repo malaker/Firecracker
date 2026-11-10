@@ -30,3 +30,7 @@ mcp/**/obj/
 # .NET build output (windows/common)
 windows/common/**/bin/
 windows/common/**/obj/
+
+# .NET build output (gateway)
+gateway/**/bin/
+gateway/**/obj/

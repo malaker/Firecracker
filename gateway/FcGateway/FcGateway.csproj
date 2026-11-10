@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <!-- fc-llm-gateway: per-agent-VM proxy from one vsock-backed Unix socket to one model provider.
+       Runs in fc-host as an unprivileged uid; published self-contained for linux-x64 by setup. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>fc-llm-gateway</AssemblyName>
+    <RootNamespace>FcGateway</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="FcGateway.Tests" />
+  </ItemGroup>
+
+</Project>

@@ -58,7 +58,20 @@ param(
     # allow networked mode, and the concurrent session limit (default 4).
     [string[]]$AllowRoot,
     [switch]$AllowNetworked,
-    [int]$MaxSessions
+    [int]$MaxSessions,
+
+    # setup (Linux): skip the agent image; Ollama URL for the codex-ollama profile.
+    [switch]$NoAgentImage,
+    [string]$OllamaUrl,
+
+    # run/shell: AI agent profile (claude, codex, codex-ollama), its task (run), model, direct mode
+    # (key inside a networked VM, no gateway) and token budget. Linux guests only.
+    [string]$Agent,
+    [string]$Prompt,
+    [string]$PromptFile,
+    [string]$Model,
+    [switch]$AgentDirect,
+    [long]$AgentTokenBudget
 )
 
 $ErrorActionPreference = 'Stop'
@@ -115,6 +128,11 @@ if ($Guest -eq 'linux') {
             exit 125
         }
     }
+}
+
+if ($Agent -and $Guest -eq 'windows') {
+    [Console]::Error.WriteLine("[fc] ERROR: agents need Linux guests (-Guest linux); Windows guests are not supported for -Agent.")
+    exit 125
 }
 
 if ($Guest -eq 'windows') {
@@ -176,7 +194,9 @@ if ($Guest -eq 'windows') {
 }
 
 if ($Command -eq 'setup') {
-    & (Join-Path $PSScriptRoot 'windows\setup-host.ps1') -Yes:$Yes
+    $hostSetup = @{ Yes = [bool]$Yes; NoAgentImage = [bool]$NoAgentImage }
+    if ($OllamaUrl) { $hostSetup.OllamaUrl = $OllamaUrl }
+    & (Join-Path $PSScriptRoot 'windows\setup-host.ps1') @hostSetup
     if ($LASTEXITCODE) { exit $LASTEXITCODE }
     & (Join-Path $PSScriptRoot 'mcp\install-mcp.ps1')
     if ($LASTEXITCODE) { [Console]::Error.WriteLine("[fc] WARNING: the MCP server was not built; 'fc.ps1 mcp' will not start.") }
@@ -230,11 +250,83 @@ if ($Command -eq 'run') {
     if ($RunInfoFile) { $argv.Add('--run-info-file'); $argv.Add((ConvertTo-WslPathAny $RunInfoFile)) }
 }
 
+# Agent runs (spec: sandbox-agents). The API key never goes on a command line: it is sent on the
+# stdin of a separate wsl.exe call and referenced by a random, single-use name.
+$keyRef = $null
+$promptTemp = $null
+if ($Agent) {
+    if ($Command -notin @('run', 'shell')) {
+        [Console]::Error.WriteLine("[fc] ERROR: -Agent works with run and shell.")
+        exit 125
+    }
+    $profiles = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'host\agents\profiles.json') -Raw | ConvertFrom-Json
+    $prof = $profiles.profiles.PSObject.Properties[$Agent]
+    if (-not $prof) {
+        [Console]::Error.WriteLine("[fc] ERROR: unknown agent profile '$Agent' (available: $(($profiles.profiles.PSObject.Properties.Name) -join ', ')).")
+        exit 125
+    }
+    $prof = $prof.Value
+    if ($Command -eq 'run') {
+        if ([bool]$Prompt -eq [bool]$PromptFile) {
+            [Console]::Error.WriteLine("[fc] ERROR: an agent run needs exactly one of -Prompt or -PromptFile.")
+            exit 125
+        }
+        if ($Prompt) {
+            $promptTemp = Join-Path ([System.IO.Path]::GetTempPath()) "fc-prompt-$([guid]::NewGuid().ToString('N')).md"
+            [System.IO.File]::WriteAllText($promptTemp, $Prompt, (New-Object System.Text.UTF8Encoding($false)))
+            $promptPath = $promptTemp
+        } else {
+            if (-not (Test-Path -LiteralPath $PromptFile -PathType Leaf)) {
+                [Console]::Error.WriteLine("[fc] ERROR: prompt file '$PromptFile' not found.")
+                exit 125
+            }
+            $promptPath = $PromptFile
+        }
+        $argv.Add('--prompt-file'); $argv.Add((ConvertTo-WslPath $promptPath))
+    }
+    if ($prof.auth -ne 'none') {
+        $key = [Environment]::GetEnvironmentVariable([string]$prof.key_env)
+        $keyFile = Join-Path $env:USERPROFILE ".fc-sandbox\keys\$($prof.provider).key"
+        if (-not $key -and (Test-Path -LiteralPath $keyFile)) { $key = (Get-Content -LiteralPath $keyFile -TotalCount 1) }
+        if (-not $key -or -not $key.Trim()) {
+            [Console]::Error.WriteLine("[fc] ERROR: no API key for profile '$Agent': set $($prof.key_env) or put the key in $keyFile.")
+            if ($promptTemp) { Remove-Item -LiteralPath $promptTemp -Force -ErrorAction SilentlyContinue }
+            exit 125
+        }
+        $keyRef = [guid]::NewGuid().ToString('N')
+        # Windows PowerShell 5.1 can prefix piped native input with a UTF-8 BOM, which would end up in
+        # the auth header; pipe without one.
+        $savedOutputEncoding = $OutputEncoding
+        $OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+        $key.Trim() | & wsl.exe -d $Distro -u root -e $Fcctl _stash-key $keyRef
+        $OutputEncoding = $savedOutputEncoding
+        $key = $null
+        if ($LASTEXITCODE -ne 0) {
+            [Console]::Error.WriteLine("[fc] ERROR: could not hand the API key to fc-host.")
+            exit 125
+        }
+        $argv.Add('--key-ref'); $argv.Add($keyRef)
+    }
+    $argv.Add('--agent'); $argv.Add($Agent)
+    if ($Model) { $argv.Add('--model'); $argv.Add($Model) }
+    if ($AgentTokenBudget) { $argv.Add('--token-budget'); $argv.Add("$AgentTokenBudget") }
+    if ($AgentDirect) {
+        # fcctl prints the warning that the key is inside the VM.
+        $argv.Add('--agent-direct')
+    }
+} elseif ($Prompt -or $PromptFile -or $Model -or $AgentDirect -or $AgentTokenBudget) {
+    [Console]::Error.WriteLine("[fc] ERROR: -Prompt, -PromptFile, -Model, -AgentDirect and -AgentTokenBudget need -Agent.")
+    exit 125
+}
+
 # Pass arguments as one base64 blob of NUL-terminated values so wsl.exe can't
 # mangle quotes or spaces inside -Cmd.
 $blob = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((($argv | ForEach-Object { "$_`0" }) -join '')))
 & wsl.exe -d $Distro -u root -e $Fcctl --argv-b64 $blob
 $linuxRc = $LASTEXITCODE
+# A stashed key is deleted once the gateway or guest has it; this catches runs that failed earlier.
+if ($keyRef) { & wsl.exe -d $Distro -u root -e $Fcctl _drop-key $keyRef 2>$null | Out-Null }
+if ($promptTemp) { Remove-Item -LiteralPath $promptTemp -Force -ErrorAction SilentlyContinue }
 
 # When cleanup is called without -Guest, also clean up Windows microVMs; fcctl-win.ps1 knows
 # where their state lives and is a no-op when there is none.
