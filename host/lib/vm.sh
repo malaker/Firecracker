@@ -13,27 +13,33 @@ validate_resources() {
     || die "requested ${mem} MiB but only ${avail_mib} MiB is free on the host (256 MiB is reserved for overhead)"
 }
 
-# vm_create <id> <slot> <vcpu> <mem-mib> <net-mode> <allow-csv> <lifetime-sec> <keep 0|1> [role] [parent-id]
+# vm_create <id> <slot> <vcpu> <mem-mib> <net-mode> <allow-csv> <lifetime-sec> <keep 0|1> [role] [parent-id] [image]
 # Starts the VM and waits for SSH. On failure the caller should vm_destroy.
 # role is "vm" (default) or "airlock"; an airlock records the run id it transfers files for.
 vm_create() {
   local id="$1" slot="$2" vcpu="$3" mem="$4" net="$5" allow="$6" lifetime="$7" keep="$8"
-  local role="${9:-vm}" parent="${10:-}"
+  local role="${9:-vm}" parent="${10:-}" image="${11:-base}" src
   local uid=$(( FC_UID_BASE + slot )) jail root dir netjson="" pid
   jail="$(jail_dir "$id")"; root="$jail/root"; dir="$(vm_dir "$id")"
 
   jq -n --arg id "$id" --argjson slot "$slot" --argjson vcpu "$vcpu" \
     --argjson mem "$mem" --arg net "$net" --arg allow "$allow" --argjson lifetime "$lifetime" \
     --argjson keep "$keep" --arg started "$(now_iso)" --arg fc "${FC_VERSION:-}" \
-    --arg role "$role" --arg parent "$parent" \
+    --arg role "$role" --arg parent "$parent" --arg image "$image" \
     '{id:$id, state:"starting", slot:$slot, vcpu:$vcpu, mem_mib:$mem, net:$net, allow:$allow,
       lifetime_sec:$lifetime, keep:($keep==1), started_at:$started, firecracker:$fc,
-      role:$role, parent:(if $parent == "" then null else $parent end)}' \
+      role:$role, parent:(if $parent == "" then null else $parent end), image:$image}' \
     > "$dir/meta.json"
 
   mkdir -p "$root"
   ln "$FC_KERNEL" "$root/vmlinux" 2>/dev/null || cp "$FC_KERNEL" "$root/vmlinux"
-  cp --sparse=always --reflink=auto "$FC_ROOTFS" "$root/rootfs.ext4"
+  # image: "base" (every ordinary VM) or "agent" (Node.js + agent clients, in-sandbox-agents).
+  case "$image" in
+    base)  src="$FC_ROOTFS" ;;
+    agent) src="$FC_AGENT_ROOTFS"; [ -f "$src" ] || { log "agent image missing; rerun 'fc.ps1 setup' (without -NoAgentImage)"; return 1; } ;;
+    *)     log "unknown image '$image'"; return 1 ;;
+  esac
+  cp --sparse=always --reflink=auto "$src" "$root/rootfs.ext4"
   chmod 0600 "$root/rootfs.ext4"
   chown "$uid:$uid" "$root/rootfs.ext4"
 
@@ -53,6 +59,12 @@ vm_create() {
     vsock: {guest_cid: 3, uds_path: "/v.sock"}
   }' > "$root/config.json"
   chown "$uid:$uid" "$root/config.json"
+
+  # Agent VMs in gateway mode get their LLM gateway before the guest boots (spec: llm-gateway).
+  # The caller sets VM_GATEWAY_PROFILE (and VM_GATEWAY_KEYFILE, VM_GATEWAY_BUDGET); airlocks never get one.
+  if [ "$role" = vm ] && [ "$image" = agent ] && [ -n "${VM_GATEWAY_PROFILE:-}" ]; then
+    gateway_start "$id" "$slot" "$VM_GATEWAY_PROFILE" "${VM_GATEWAY_KEYFILE:-}" "${VM_GATEWAY_BUDGET:-}" || return 1
+  fi
 
   # No --daemonize: the jailer execs firecracker, so $! is the VMM's pid.
   setsid "$FC_HOME/bin/jailer" --id "$id" \
@@ -79,17 +91,17 @@ vm_create() {
   meta_set_str "$id" state running
 }
 
-# boot_vm_with <vcpu> <mem-mib> <net> <allow-csv> <lifetime-sec> <keep 0|1> <role> <parent-id>
+# boot_vm_with <vcpu> <mem-mib> <net> <allow-csv> <lifetime-sec> <keep 0|1> <role> <parent-id> [image]
 # Boots a VM with explicit settings; prints nothing, sets VM_ID. Exits via die on failure,
 # so callers that must survive a failed boot (the airlock) run it in a subshell.
 boot_vm_with() {
-  local vcpu="$1" mem="$2" net="$3" allow="$4" lifetime="$5" keep="$6" role="$7" parent="$8" slot
+  local vcpu="$1" mem="$2" net="$3" allow="$4" lifetime="$5" keep="$6" role="$7" parent="$8" image="${9:-base}" slot
   validate_resources "$vcpu" "$mem"
   [ -c /dev/kvm ] || die "/dev/kvm is missing; run 'fc.ps1 doctor'"
   VM_ID="$(new_run_id)"
   slot="$(alloc_slot "$VM_ID")" || die "no free VM slots"
   log "starting ${role/vm/VM} $VM_ID (net=$net vcpu=$vcpu mem=${mem}MiB lifetime=${lifetime}s${parent:+ for $parent})"
-  if ! vm_create "$VM_ID" "$slot" "$vcpu" "$mem" "$net" "$allow" "$lifetime" "$keep" "$role" "$parent"; then
+  if ! vm_create "$VM_ID" "$slot" "$vcpu" "$mem" "$net" "$allow" "$lifetime" "$keep" "$role" "$parent" "$image"; then
     vm_destroy "$VM_ID" 1
     die "VM $VM_ID failed to start"
   fi
@@ -128,6 +140,9 @@ vm_destroy() {
   keep="$(meta_get "$id" keep)"
 
   kill_pid "$(meta_get "$id" pid)"
+  gateway_stop "$id"
+  # A run keeps the gateway's folder until it has copied llm.log into its results.
+  [ "$(meta_get "$id" gateway_keep_log)" = true ] || gateway_discard "$id"
   wpid="$(meta_get "$id" watchdog_pid)"
   # Don't kill ourselves when the watchdog is the one destroying the VM.
   if [ -n "$wpid" ] && [ "$wpid" != "$$" ]; then

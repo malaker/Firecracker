@@ -3,7 +3,7 @@
 set -euo pipefail
 
 FC_HOME="${FC_HOME:-$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)}"
-for f in common state ssh net vm airlock doctor; do
+for f in common state ssh net vm airlock agent doctor; do
   # shellcheck source=/dev/null
   . "$FC_HOME/lib/$f.sh"
 done
@@ -37,6 +37,15 @@ VM options:
   --mem MIB                  Memory in MiB (default 1024)
   --timeout DUR              Maximum lifetime, e.g. 90s, 30m, 1h (default 30m)
   --keep                     Keep the VM's disk after it stops, for inspection
+  --image base|agent         Boot image (default base; agent = Node.js + agent clients)
+
+Agent options (run and shell; Linux guests):
+  --agent PROFILE            Run an AI agent: claude, codex or codex-ollama (agents/profiles.json)
+  --prompt-file FILE         run: the task for the agent (headless)
+  --model MODEL              Model to use (default: the profile's default; must match its allowlist)
+  --agent-direct             Direct mode: no gateway, networked VM, real API key INSIDE the VM
+  --token-budget N           Gateway token budget for this run (default from profiles.json)
+  --key-ref REF              API key stashed with '_stash-key REF' (fc.ps1 does this)
 
 Exit codes (run): the guest command's exit code, 124 on timeout, 125 on sandbox failure.
 EOF
@@ -45,7 +54,8 @@ EOF
 # --- option parsing ---------------------------------------------------------
 OPT_NET=isolated OPT_ALLOW="" OPT_VCPU=$DEFAULT_VCPU OPT_MEM=$DEFAULT_MEM_MIB
 OPT_TIMEOUT=$DEFAULT_TIMEOUT OPT_KEEP=0 OPT_PAYLOAD="" OPT_CMD="" OPT_RESULTS="$FC_RESULTS_DEFAULT"
-OPT_BOOT=0 OPT_RUN_INFO="" POSITIONAL=()
+OPT_BOOT=0 OPT_RUN_INFO="" OPT_IMAGE=base POSITIONAL=()
+OPT_AGENT="" OPT_PROMPT_FILE="" OPT_MODEL="" OPT_AGENT_DIRECT=0 OPT_TOKEN_BUDGET="" OPT_KEY_REF=""
 
 parse_opts() {
   while (( $# )); do
@@ -60,6 +70,13 @@ parse_opts() {
       --cmd)         OPT_CMD="$2"; shift ;;
       --results-dir) OPT_RESULTS="$2"; shift ;;
       --run-info-file) OPT_RUN_INFO="$2"; shift ;;
+      --image)       OPT_IMAGE="$2"; shift ;;
+      --agent)       OPT_AGENT="$2"; shift ;;
+      --prompt-file) OPT_PROMPT_FILE="$2"; shift ;;
+      --model)       OPT_MODEL="$2"; shift ;;
+      --agent-direct) OPT_AGENT_DIRECT=1 ;;
+      --token-budget) OPT_TOKEN_BUDGET="$2"; shift ;;
+      --key-ref)     OPT_KEY_REF="$2"; shift ;;
       --boot)        OPT_BOOT=1 ;;
       -h|--help)     usage; exit 0 ;;
       --*)           die "unknown option '$1'" ;;
@@ -83,17 +100,31 @@ parse_opts() {
     done
   fi
   (( OPT_TIMEOUT > 0 )) || die "--timeout must be positive"
+  if [ -n "$OPT_AGENT" ]; then
+    agent_check_opts
+  elif (( OPT_AGENT_DIRECT )) || [ -n "$OPT_PROMPT_FILE$OPT_MODEL$OPT_TOKEN_BUDGET" ]; then
+    die "--agent-direct, --prompt-file, --model and --token-budget need --agent"
+  fi
 }
 
 # Boot a VM with the parsed options; prints nothing, sets VM_ID.
 boot_vm() {
-  boot_vm_with "$OPT_VCPU" "$OPT_MEM" "$OPT_NET" "$OPT_ALLOW" "$1" "$OPT_KEEP" vm ""
+  boot_vm_with "$OPT_VCPU" "$OPT_MEM" "$OPT_NET" "$OPT_ALLOW" "$1" "$OPT_KEEP" vm "" "$OPT_IMAGE"
 }
 
 # --- commands ---------------------------------------------------------------
 cmd_run() {
-  [ -n "$OPT_CMD" ] || die "run needs --cmd"
-  [ -n "$OPT_PAYLOAD" ] && [ -d "$OPT_PAYLOAD" ] || die "payload directory '$OPT_PAYLOAD' not found"
+  if [ -n "$OPT_AGENT" ]; then
+    # Agent run (spec: sandbox-agents): the task comes from the prompt file, the payload is optional.
+    [ -z "$OPT_CMD" ] || die "use either --cmd or --agent, not both"
+    [ -n "$OPT_PROMPT_FILE" ] && [ -s "$OPT_PROMPT_FILE" ] || die "an agent run needs a non-empty --prompt-file"
+    (( $(stat -c %s "$OPT_PROMPT_FILE") <= 1048576 )) || die "the prompt is larger than 1 MiB"
+    [ -z "$OPT_PAYLOAD" ] || [ -d "$OPT_PAYLOAD" ] || die "payload directory '$OPT_PAYLOAD' not found"
+    OPT_CMD="fc-agent headless"
+  else
+    [ -n "$OPT_CMD" ] || die "run needs --cmd"
+    [ -n "$OPT_PAYLOAD" ] && [ -d "$OPT_PAYLOAD" ] || die "payload directory '$OPT_PAYLOAD' not found"
+  fi
 
   local started rc=0 timed_out=false error="" out t0 elapsed
   started="$(now_iso)"
@@ -101,14 +132,17 @@ cmd_run() {
   out="$OPT_RESULTS/$VM_ID"
   mkdir -p "$out/out"
   trap 'vm_destroy "$VM_ID"' EXIT
+  [ -z "$OPT_AGENT" ] || meta_set "$VM_ID" gateway_keep_log true
   # Written up front (no end time yet) so the watchdog can finalise it if
   # this controller dies before the run ends.
   write_run_meta "$out" "$started" null false ""
   meta_set_str "$VM_ID" results_dir "$out"
   [ -z "$OPT_RUN_INFO" ] || write_run_info "$OPT_RUN_INFO" "$out"
 
-  if ! upload_dir "$VM_ID" "$OPT_PAYLOAD" /work/in; then
+  if [ -n "$OPT_PAYLOAD" ] && ! upload_dir "$VM_ID" "$OPT_PAYLOAD" /work/in; then
     rc=$EXIT_INFRA error="payload upload failed"
+  elif [ -n "$OPT_AGENT" ] && ! agent_prepare_guest "$VM_ID" "$OPT_PROMPT_FILE"; then
+    rc=$EXIT_INFRA error="could not prepare the agent in the guest"
   else
     fc_ssh "$VM_ID" "mkdir -p /work/out" </dev/null || true
     log "running: $OPT_CMD"
@@ -132,8 +166,16 @@ cmd_run() {
   # VM is destroyed as soon as its bytes are on the host; a refused collection keeps the
   # guest's exit code and is recorded in meta.json.
   airlock_transfer "$VM_ID" /work/out "$out/out" release_run_vm || true
+  local agent_json=null
+  if [ -n "$OPT_AGENT" ]; then
+    # The gateway stopped with the VM; its log and totals go into the results, then its folder goes.
+    local gw="$FC_GATEWAY_DIR/$VM_ID"
+    [ -f "$gw/llm.log" ] && cp "$gw/llm.log" "$out/llm.log"
+    agent_json="$(agent_meta_json "$gw/totals.json")"
+    gateway_discard "$VM_ID"
+  fi
   echo "$rc" > "$out/exit_code"
-  write_run_meta "$out" "$started" "$rc" "$timed_out" "$error" "$(collection_json)"
+  write_run_meta "$out" "$started" "$rc" "$timed_out" "$error" "$(collection_json)" "$agent_json"
   [ -z "$error" ] || log "error: $error"
   log "results: $out (exit code $rc)"
   exit "$rc"
@@ -162,7 +204,7 @@ write_run_info() {
     || log "warning: could not write the run info file $1"
 }
 
-# write_run_meta <dir> <started> <exit-code|null> <timed-out> <error> [collection-json]
+# write_run_meta <dir> <started> <exit-code|null> <timed-out> <error> [collection-json] [agent-json]
 # An exit code of null means the run is still in progress (no ended_at).
 write_run_meta() {
   jq -n --arg id "$VM_ID" --arg cmd "$OPT_CMD" --arg payload "$OPT_PAYLOAD" --arg net "$OPT_NET" \
@@ -170,11 +212,13 @@ write_run_meta() {
     --argjson timeout "$OPT_TIMEOUT" --arg started "$2" --arg ended "$(now_iso)" \
     --argjson rc "$3" --argjson timed_out "$4" --arg error "$5" \
     --arg fc "${FC_VERSION:-}" --argjson keep "$OPT_KEEP" --argjson collection "${6:-null}" \
+    --argjson agent "${7:-null}" \
     '{run_id:$id, command:$cmd, payload:$payload, net:$net, allow:$allow, vcpu:$vcpu,
       mem_mib:$mem, timeout_sec:$timeout, started_at:$started,
       ended_at:(if $rc == null then null else $ended end),
       exit_code:$rc, timed_out:$timed_out, error:(if $error == "" then null else $error end),
-      keep_disk:($keep==1), firecracker:$fc, collection:$collection}' > "$1/meta.json"
+      keep_disk:($keep==1), firecracker:$fc, collection:$collection}
+     + (if $agent == null then {} else {agent:$agent} end)' > "$1/meta.json"
 }
 
 # `timeout` runs fc_ssh through `bash -c`, which needs these exported.
@@ -184,6 +228,14 @@ export FC_SSH_KEY FC_HOME FC_JAIL_BASE
 cmd_shell() {
   boot_vm "$OPT_TIMEOUT"
   trap 'vm_destroy "$VM_ID"' EXIT
+  if [ -n "$OPT_AGENT" ]; then
+    agent_prepare_guest "$VM_ID" || die "could not prepare the agent in the guest"
+    log "agent VM $VM_ID ready ($AGENT_PROFILE, $AGENT_MODE mode); run 'fc-agent interactive'; exit the shell to destroy it"
+    set +e
+    fc_ssh "$VM_ID" -t 'eval "$(fc-agent env)"; cd /work; exec bash -i'
+    set -e
+    return
+  fi
   log "VM $VM_ID ready; exit the shell to destroy it"
   set +e
   fc_ssh "$VM_ID" -t
@@ -191,6 +243,7 @@ cmd_shell() {
 }
 
 cmd_start() {
+  [ -z "$OPT_AGENT" ] || die "--agent works with run and shell, not start"
   boot_vm "$OPT_TIMEOUT"
   echo "$VM_ID"
 }
@@ -294,6 +347,13 @@ cmd_cleanup() {
     kill -KILL "$pid" 2>/dev/null || true
   done
   [ -d "$FC_STAGING" ] && find "${FC_STAGING:?}" -mindepth 1 -delete 2>/dev/null || true
+  # LLM gateways (their uid range), their sockets and logs, and any stashed provider keys.
+  for pid in $(ps -eo uid=,pid= | awk -v lo="$FC_GATEWAY_UID_BASE" -v hi="$(( FC_GATEWAY_UID_BASE + FC_MAX_SLOTS ))" \
+      '$1 >= lo && $1 < hi {print $2}'); do
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+  [ -d "$FC_GATEWAY_DIR" ] && find "${FC_GATEWAY_DIR:?}" -mindepth 1 -delete 2>/dev/null || true
+  [ -d "$FC_KEYS" ] && find "${FC_KEYS:?}" -mindepth 1 -delete 2>/dev/null || true
   log "cleanup complete"
 }
 
@@ -342,6 +402,8 @@ main() {
     stop)    cmd_stop ;;
     cleanup) cmd_cleanup ;;
     _expire) cmd_expire ;;
+    _stash-key) cmd_stash_key ;;
+    _drop-key) cmd_drop_key ;;
     *) usage >&2; exit 2 ;;
   esac
 }

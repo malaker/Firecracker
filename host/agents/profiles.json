@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "limits": {
+    "max_requests": 500,
+    "max_request_bytes": 16777216,
+    "max_response_bytes": 268435456,
+    "request_timeout_sec": 600,
+    "token_budget": 2000000
+  },
+  "profiles": {
+    "claude": {
+      "client": "claude",
+      "provider": "anthropic",
+      "upstream": "https://api.anthropic.com",
+      "auth": "x-api-key",
+      "key_env": "ANTHROPIC_API_KEY",
+      "default_model": "claude-opus-5-5",
+      "models": ["claude-*"],
+      "endpoints": ["POST /v1/messages", "POST /v1/messages/count_tokens"],
+      "usage_style": "anthropic",
+      "direct": true
+    },
+    "codex": {
+      "client": "codex",
+      "provider": "openai",
+      "upstream": "https://api.openai.com",
+      "auth": "bearer",
+      "key_env": "OPENAI_API_KEY",
+      "default_model": "gpt-5.1-codex-max",
+      "models": ["gpt-*"],
+      "endpoints": ["POST /v1/responses", "POST /v1/chat/completions", "GET /v1/models"],
+      "usage_style": "openai",
+      "direct": true
+    },
+    "codex-ollama": {
+      "client": "codex",
+      "provider": "ollama",
+      "upstream": "ollama",
+      "auth": "none",
+      "key_env": "",
+      "default_model": "gpt-oss:20b",
+      "models": ["*"],
+      "endpoints": ["POST /v1/responses", "POST /v1/chat/completions", "GET /v1/models"],
+      "usage_style": "openai",
+      "direct": false
+    }
+  }
+}

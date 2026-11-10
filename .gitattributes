@@ -2,6 +2,9 @@
 *.sh text eol=lf
 host/bin/* text eol=lf
 *.env text eol=lf
+# Installed into Linux guests and fc-host as-is.
+images/agent/fc-agent text eol=lf
+host/agents/* text eol=lf
 # PowerShell scripts are stored and checked out byte-for-byte, so a clone gets exactly the
 # committed bytes (and a signature added locally under AllSigned is not broken by git).
 *.ps1 -text

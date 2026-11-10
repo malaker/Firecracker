@@ -6,7 +6,11 @@
 [CmdletBinding()]
 param(
     # Don't ask before changing .wslconfig / restarting WSL.
-    [switch]$Yes
+    [switch]$Yes,
+    # Skip building the agent image (-Agent runs are then unavailable).
+    [switch]$NoAgentImage,
+    # URL of an Ollama server reachable from fc-host, for the codex-ollama agent profile.
+    [string]$OllamaUrl
 )
 
 $ErrorActionPreference = 'Stop'
@@ -90,8 +94,16 @@ $airlockOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Pa
 if ($LASTEXITCODE -ne 0) { throw "Building the guest output airlock tool failed (see the message above)." }
 $airlockWsl = ConvertTo-WslPath (@($airlockOut)[-1])
 
-# 4. Packages, binaries, images, controller.
+# 4. LLM gateway for agent VMs (in-sandbox-agents).
+$gatewayOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $RepoRoot 'gateway\install-gateway.ps1')
+if ($LASTEXITCODE -ne 0) { throw "Building the LLM gateway failed (see the message above)." }
+$gatewayWsl = ConvertTo-WslPath (@($gatewayOut)[-1])
+
+# 5. Packages, binaries, images (base and agent), controller.
 $repoWsl = ConvertTo-WslPath $RepoRoot
-if ((Invoke-Root @('bash', "$repoWsl/host/provision.sh", $repoWsl, $airlockWsl)) -ne 0) {
+$provisionArgs = @('bash', "$repoWsl/host/provision.sh", $repoWsl, $airlockWsl, $gatewayWsl)
+if ($NoAgentImage) { $provisionArgs += '--no-agent-image' }
+if ($OllamaUrl) { $provisionArgs += @('--ollama-url', $OllamaUrl) }
+if ((Invoke-Root $provisionArgs) -ne 0) {
     throw "Provisioning failed (see output above)."
 }

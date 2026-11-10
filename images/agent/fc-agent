@@ -1,0 +1,82 @@
+#!/bin/bash
+# fc-agent - starts an agent client inside an fc-sandbox agent VM (change: in-sandbox-agents, D6).
+# The controller writes /work/.fc/agent.env (FC_AGENT_PROFILE, FC_AGENT_CLIENT, FC_AGENT_MODEL,
+# FC_AGENT_MODE=gateway|direct) and, in direct mode only, the key to /root/.fc-agent/key.
+#   fc-agent headless      run the task in /work/.fc/prompt.md; transcript to /work/out/agent-transcript.jsonl
+#   fc-agent interactive   start the client interactively
+#   fc-agent env           print the client environment as shell exports (for 'shell -Agent')
+set -euo pipefail
+
+ENV_FILE=/work/.fc/agent.env
+PROMPT=/work/.fc/prompt.md
+TRANSCRIPT=/work/out/agent-transcript.jsonl
+GATEWAY=http://127.0.0.1:8080
+DUMMY_KEY=fc-sandbox-dummy-key
+
+[ -r "$ENV_FILE" ] || { echo "fc-agent: $ENV_FILE is missing (not an agent run?)" >&2; exit 125; }
+# shellcheck source=/dev/null
+. "$ENV_FILE"
+: "${FC_AGENT_CLIENT:?}" "${FC_AGENT_MODEL:?}" "${FC_AGENT_MODE:?}"
+
+key() {
+  if [ "$FC_AGENT_MODE" = direct ]; then cat /root/.fc-agent/key; else echo "$DUMMY_KEY"; fi
+}
+
+# Client environment and fixed arguments.
+CODEX_ARGS=()
+setup_env() {
+  export HOME=/root
+  case "$FC_AGENT_CLIENT" in
+    claude)
+      export IS_SANDBOX=1 DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+      ANTHROPIC_API_KEY="$(key)"; export ANTHROPIC_API_KEY
+      if [ "$FC_AGENT_MODE" = gateway ]; then export ANTHROPIC_BASE_URL="$GATEWAY"; fi
+      ;;
+    codex)
+      if [ "$FC_AGENT_MODE" = gateway ]; then
+        # A custom provider makes Codex use plain HTTP + SSE instead of a WebSocket (spike 1.2).
+        FC_GW_KEY="$(key)"; export FC_GW_KEY
+        CODEX_ARGS=(-c model_provider=fcgw -c 'model_providers.fcgw.name="fc-gateway"'
+          -c "model_providers.fcgw.base_url=\"$GATEWAY/v1\"" -c 'model_providers.fcgw.env_key="FC_GW_KEY"'
+          -c 'model_providers.fcgw.wire_api="responses"')
+      else
+        OPENAI_API_KEY="$(key)"; export OPENAI_API_KEY
+      fi
+      ;;
+    *) echo "fc-agent: unknown client '$FC_AGENT_CLIENT'" >&2; exit 125 ;;
+  esac
+}
+
+cmd="${1:-}"
+setup_env
+cd /work
+case "$cmd" in
+  headless)
+    [ -r "$PROMPT" ] || { echo "fc-agent: $PROMPT is missing" >&2; exit 125; }
+    mkdir -p /work/out
+    if [ "$FC_AGENT_CLIENT" = claude ]; then
+      exec claude -p "$(cat "$PROMPT")" --model "$FC_AGENT_MODEL" --output-format stream-json --verbose \
+        --dangerously-skip-permissions > "$TRANSCRIPT"
+    else
+      exec codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox \
+        "${CODEX_ARGS[@]}" -m "$FC_AGENT_MODEL" "$(cat "$PROMPT")" < /dev/null > "$TRANSCRIPT"
+    fi
+    ;;
+  interactive)
+    if [ "$FC_AGENT_CLIENT" = claude ]; then
+      exec claude --model "$FC_AGENT_MODEL" --dangerously-skip-permissions
+    else
+      exec codex --dangerously-bypass-approvals-and-sandbox "${CODEX_ARGS[@]}" -m "$FC_AGENT_MODEL"
+    fi
+    ;;
+  env)
+    for v in HOME IS_SANDBOX DISABLE_AUTOUPDATER CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC ANTHROPIC_API_KEY ANTHROPIC_BASE_URL FC_GW_KEY OPENAI_API_KEY; do
+      [ -n "${!v:-}" ] && printf 'export %s=%q\n' "$v" "${!v}"
+    done
+    echo "echo 'Agent VM ($FC_AGENT_PROFILE, $FC_AGENT_MODE mode). Run: fc-agent interactive'"
+    ;;
+  *)
+    echo "usage: fc-agent headless|interactive|env" >&2
+    exit 2
+    ;;
+esac

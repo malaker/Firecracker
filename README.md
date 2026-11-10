@@ -43,6 +43,7 @@ flowchart LR
 - **Hard timeouts.** A detached watchdog enforces every VM's lifetime, even if the controller crashes.
 - **Two network modes.** `isolated` has no network device at all. `networked` has controlled egress with the host and private ranges blocked, plus an optional destination allowlist: NAT-ed through nftables for Linux guests, and through a host-side egress proxy for Windows guests, which still have no network adapter.
 - **Simple results.** Each run's exit code, stdout/stderr, metadata and output files are collected into `runs\<run-id>\` on Windows.
+- **Agents in the sandbox.** Run Claude Code or Codex (OpenAI or a local Ollama) inside a Linux microVM with a task prompt, to analyse a payload or probe the sandbox from the inside. In the default gateway mode the VM has no network and the API key stays on the host. See [Agents in the sandbox](#agents-in-the-sandbox--agent).
 - **Guest output airlock.** Output files never reach the host by unpacking a guest's archive: a fresh airlock VM validates and re-encodes them, and the host checks the result again without admin rights before writing anything. Links, devices, unsafe names and oversized output are refused. See [Guest output airlock](#guest-output-airlock).
 
 ## Requirements
@@ -211,6 +212,13 @@ Options for `run`, `shell`, `start` and `setup`:
 | `-MemMib <n>` | 1024 | Guest memory in MiB (at least 128; must fit in free host memory) |
 | `-Timeout <dur>` | `30m` | Hard lifetime, e.g. `90s`, `10m`, `1h` |
 | `-Keep` | off | Keep the VM's disk/container after it stops, for inspection; removed by `stop` or `cleanup` |
+| `-Agent claude\|codex\|codex-ollama` | none | `run` and `shell`, Linux only: boot the agent image with that profile (see [Agents in the sandbox](#agents-in-the-sandbox--agent)) |
+| `-Prompt '<text>'`, `-PromptFile <file>` | none | Agent `run` only (exactly one): the agent's task |
+| `-Model <name>` | the profile's default | Agent only: model to use; must match the profile's model list |
+| `-AgentDirect` | off | Agent only: direct mode (networked VM, API key inside the VM) |
+| `-AgentTokenBudget <n>` | 2,000,000 | Agent gateway mode only: total tokens the gateway forwards before refusing with `429` |
+| `-NoAgentImage` | off | `setup` only: skip building the agent image (about 1 GB of downloads) |
+| `-OllamaUrl <url>` | Windows host, port 11434 | `setup` only: Ollama server for the `codex-ollama` profile |
 
 VMs created with `start` are also subject to `-Timeout`.
 
@@ -280,12 +288,75 @@ Every `run` writes `runs\<run-id>\` (run ids look like `20261027-183001-3461`):
 | `exit_code` | Exit code of the run |
 | `stdout.log`, `stderr.log` | Output of the guest command, written as it runs (kept on timeout) |
 | `out\` | Everything the command wrote to `/work/out` (Linux) or `C:\work\out` (Windows) in the guest |
-| `meta.json` | Run id, command, payload, network mode, allowlist, vCPU, memory, timeout, start/end time, `timed_out`, `error`, `collection` (Linux: how `out\` was collected through the [airlock](#guest-output-airlock)), plus `firecracker` (Linux) or `guest`, `flavour`, `image_repo`, `win_runtime` (Windows) |
+| `meta.json` | Run id, command, payload, network mode, allowlist, vCPU, memory, timeout, start/end time, `timed_out`, `error`, `collection` (Linux: how `out\` was collected through the [airlock](#guest-output-airlock)), plus `firecracker` (Linux) or `guest`, `flavour`, `image_repo`, `win_runtime` (Windows). Agent runs add `agent` (see [Agents in the sandbox](#agents-in-the-sandbox--agent)) |
+| `llm.log` | Agent runs in gateway mode only: one line per model API call (see [Agent results](#agent-results)) |
 | `net.log` | Windows `networked` runs only: one line per connection attempt with `decision` (`allowed`, `denied`, `failed`), `host`, `port`, the resolved `ip`, `reason` and `bytes_up`/`bytes_down` (kept on timeout) |
 
 Exit codes: the guest command's own exit code; **124** when the run hit its timeout; **125** when the sandbox itself failed (boot, upload, missing payload). For commands that can themselves exit with 124 or 125, `timed_out` and `error` in `meta.json` tell the cases apart.
 
 Inside the guest the payload is at `/work/in` (Linux) or `C:\work\in` (Windows) and the working directory is `/work` or `C:\work`, so `-Cmd './in/scan.sh'` (Linux) or `-Cmd '.\in\hello.cmd'` (Windows) runs a script from the payload. Files written to `out/` are copied back. Commands run as `root` (Linux) or `ContainerAdministrator` (Windows). The Linux guest image is a minimal Ubuntu 24.04 with `curl`, `socat`, `iproute2` and `openssh`. The Windows Nano Server 2025 flavours include `curl.exe`, `tar.exe`, 32-bit `SysWOW64` (on `-x86` flavours), `nanoserver_sta_shim.dll`, and `.NET 10` or `.NET Framework 4.8.1`.
+
+## Agents in the sandbox (`-Agent`)
+
+An agent run boots a Linux microVM from the **agent image** and runs the agent headless with a task prompt. The image is the base image plus Node.js, [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [Codex](https://github.com/openai/codex), pinned in [images/agent/package-lock.json](images/agent/package-lock.json). Use it to have an agent inspect a payload inside the sandbox, or to have it probe the sandbox itself from the inside. Windows guests are not supported (`-Agent` with `-Guest windows` exits `125`).
+
+```powershell
+$env:ANTHROPIC_API_KEY = '<key>'      # or put it in %USERPROFILE%\.fc-sandbox\keys\anthropic.key
+.\fc.ps1 run -Agent claude -Payload .\samples\hello -Prompt 'Explain what ./in/hello.sh does. Do not run it.'
+.\fc.ps1 run -Agent codex -PromptFile .\task.md -Timeout 20m      # OPENAI_API_KEY or keys\openai.key
+.\fc.ps1 run -Agent codex-ollama -Prompt 'Map the guest from the inside: users, mounts, devices.'
+.\fc.ps1 shell -Agent claude          # interactive: run 'fc-agent interactive', or the client yourself
+```
+
+`.\fc.ps1 setup` builds the agent image (about 1 GB of downloads, a 6 GiB sparse image) and the LLM gateway (`fc-llm-gateway`, .NET 10). Skip the image with `-NoAgentImage`. `.\fc.ps1 doctor` reports whether the image and the gateway are there.
+
+**Profiles** ([host/agents/profiles.json](host/agents/profiles.json)):
+
+| Profile | Client | Provider | Default model | Key |
+|---|---|---|---|---|
+| `claude` | Claude Code | Anthropic API | `claude-opus-5-5` (`claude-*` allowed) | `ANTHROPIC_API_KEY` or `%USERPROFILE%\.fc-sandbox\keys\anthropic.key` |
+| `codex` | Codex | OpenAI API | `gpt-5.1-codex-max` (`gpt-*` allowed) | `OPENAI_API_KEY` or `%USERPROFILE%\.fc-sandbox\keys\openai.key` |
+| `codex-ollama` | Codex | your Ollama server | `gpt-oss:20b` (any model) | none |
+
+The environment variable wins over the key file, and only the key file's first line is read. `fc.ps1` hands the key to `fc-host` on the stdin of a separate call, never on a command line. The key is deleted when the run ends.
+
+**Ollama:** `codex-ollama` uses the Ollama server on the Windows host (`http://<host>:11434`, as WSL sees it) unless setup was given another one with `.\fc.ps1 setup -OllamaUrl http://<server>:11434`. Ollama must listen on an address WSL can reach (`OLLAMA_HOST=0.0.0.0` on the Windows host). `doctor` warns when it is not reachable.
+
+### Gateway mode (default) and direct mode
+
+```mermaid
+flowchart LR
+    subgraph vm["agent microVM (no network device)"]
+        agent["claude / codex"] --> shim["127.0.0.1:8080<br/>fc-llm-shim"]
+    end
+    shim -. "vsock" .-> gw["fc-llm-gateway<br/>(per VM, unprivileged)"]
+    keys[("API key<br/>(host only)")] --> gw
+    gw -- "allowlisted endpoints and models,<br/>key added, budgets" --> prov(("Anthropic / OpenAI / Ollama"))
+    gw --> log[("llm.log")]
+```
+
+**Gateway mode:** the VM is isolated, with no network device. The agent's only way out is a per-VM gateway on the host, reached over vsock at `127.0.0.1:8080` in the guest. The gateway runs as its own unprivileged uid and:
+
+- adds the API key on the way out, so **the key never enters the VM**. The client inside gets a placeholder.
+- forwards only the profile's endpoints and models (`403` otherwise).
+- refuses requests over 16 MiB (`413`). It stops at 500 requests or at the token budget (`429`). The budget defaults to 2,000,000 tokens; change it with `-AgentTokenBudget`. Responses are capped at 256 MiB and each request at 600 s.
+- logs every call to `llm.log`.
+
+**Direct mode (`-AgentDirect`):** the VM is `networked`, with the usual egress rules (`-Allow` works). The agent talks to the provider itself, with no gateway. Use it for tests where the gateway would get in the way, such as checking the client's own network behaviour.
+
+> **Warning:** in direct mode **the API key is inside the VM**, at `/root/.fc-agent/key`. Anything running in the VM can read and exfiltrate it. Use a dedicated, low-limit key and never use direct mode with untrusted payloads. `fc.ps1` prints a warning on every direct-mode run. `codex-ollama` has no direct mode, because the host protection blocks the Ollama server on the host.
+
+### Agent results
+
+Besides the usual files, an agent run writes:
+
+| File | Content |
+|---|---|
+| `out\agent-transcript.jsonl` | The client's JSON event stream, collected through the [airlock](#guest-output-airlock) like any output |
+| `llm.log` | Gateway mode only: one line per API call (`ts= method= path= model= decision= reason= status= bytes_up= bytes_down= tokens_in= tokens_out=`). `decision` is `forwarded`, `refused` or `failed`. Keys are never logged |
+| `meta.json` → `agent` | `profile`, `client`, `client_version`, `provider`, `model`, `mode` (`gateway` or `direct`). Gateway mode adds `requests`, `refused` and `tokens` |
+
+The run's exit code is the client's. Inside the guest the prompt is at `/work/.fc/prompt.md`, and the payload, if any, is at `/work/in` as usual.
 
 ## MCP server (`fc.ps1 mcp`)
 
@@ -324,7 +395,7 @@ Any other stdio MCP client takes the same command, for example:
 
 | Tool | Does |
 |---|---|
-| `sandbox_run` | One-shot run, like `fc.ps1 run`: payload, command and VM options (`guest`, `net`, `allow`, `vcpu`, `mem_mib`, `timeout`, `flavour`). Returns run id, exit code, timeout flag, stdout/stderr, result folder and output files |
+| `sandbox_run` | One-shot run, like `fc.ps1 run`: payload, command and VM options (`guest`, `net`, `allow`, `vcpu`, `mem_mib`, `timeout`, `flavour`). Returns run id, exit code, timeout flag, stdout/stderr, result folder and output files. With `agent` (`claude`, `codex`, `codex-ollama`) and `prompt` instead of `command`, it runs an [agent](#agents-in-the-sandbox--agent) in gateway mode (Linux, isolated, payload optional, `model` to pick the model). The result then also has `agent`, `transcript_path` and `llm_log_path`. Direct mode is not available through MCP. The server takes API keys from its own environment or the key files |
 | `sandbox_start` | Start a VM that stays up between calls; returns a session id |
 | `sandbox_exec` | Run a command in a session in `/work`; state persists. Full logs go to `runs\<session>\exec\<n>\` |
 | `sandbox_put` | Copy a host file or folder (inside the allowed roots) into a session |
@@ -356,6 +427,10 @@ A refused collection keeps the guest command's exit code, leaves `out\` empty, p
 
 ## Security considerations and limitations
 
+- **LLM gateway (agent gateway mode):** the gateway is new host code that reads guest data: HTTP requests from the agent VM. It is written in a memory-safe language and runs per VM as an unprivileged uid that only that VM's jail can reach, with limits on headers, sizes and connections. It checks the endpoint and the model, not the request's content. An agent, or a payload that takes the agent over, can send anything it sees to the provider, within the budgets.
+- **Data sent to providers:** an agent run sends the prompt to Anthropic, OpenAI or your Ollama server, along with whatever the agent reads in the VM, including payload contents. Use `codex-ollama` with a local server for samples that must not leave your machine.
+- **Direct mode puts the API key in the VM** and gives the VM network access. Treat any key used with `-AgentDirect` as exposed.
+- **Agents follow instructions in what they read:** a payload can contain text aimed at the agent. Inside the VM that can only misuse the agent's budget and output. Treat its transcript and output as untrusted, like any guest output.
 - **MCP server and prompt injection:** a sample's output reaches the host agent through the MCP tools. The server bounds and marks that output and offers no host-side tools, but a marker does not stop a model from following instructions in it; the client's permission settings remain the final control.
 - **Elevated MCP clients:** using Windows guests through MCP means running the MCP client elevated, so everything that client does runs with administrator rights. Use a separate elevated client session only for Windows-guest work.
 - **Killed MCP server:** if the server process is killed instead of stopped, its sessions keep running until their hard timeout (default 30 minutes; use a shorter `timeout` for agent sessions) or until `fc.ps1 cleanup`.
@@ -390,7 +465,11 @@ dotnet test windows\egress
 # Guest output airlock tool unit tests
 dotnet test airlock
 
+# LLM gateway unit tests (no VM needed)
+dotnet test gateway
+
 # MCP server unit tests; FC_MCP_INTEGRATION=1 also runs the tools against real Linux VMs
+# (including an agent run against the local fake provider)
 dotnet test mcp
 $env:FC_MCP_INTEGRATION = '1'; dotnet test mcp
 
@@ -401,6 +480,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\smoke-mcp\mcp.ps1
 The Linux suite must run inside the provisioned `fc-host` distro as root. It checks that first: anywhere else (Git Bash, another distro, a non-root user, or before `.\fc.ps1 setup`) it lists what is missing and exits 125 without reporting any check results. A single part, such as `tests/smoke/net.sh`, can be run the same way. The suite tests the controller installed in `/opt/fc-sandbox`, so after changing anything under `host\`, re-run `.\fc.ps1 setup` before testing.
 
 The Windows suite and each of its parts (`net-isolated.ps1`, `lifecycle.ps1`, `net-protect.ps1`) take `-WinRuntime docker|containerd`, default `docker`, and run every command against that backend. `all.ps1` runs `setup` for the selected runtime, which changes the host's default runtime, image repository and flavour; it restores the previous `config.json` when it finishes, passes or fails. If the suite process is killed outright, re-run `.\fc.ps1 setup -Guest windows -WinRuntime docker` to reset the default.
+
+The agent tests (`tests/smoke/agents.sh`, part of `all.sh`, and the MCP tests) use a local fake provider ([tests/smoke/fake-provider.py](tests/smoke/fake-provider.py)), so they need no API keys. The one exception is a direct-mode check that sends an invalid key to the real Anthropic API.
 
 After changing anything under `windows\egress`, re-run `.\fc.ps1 setup -Guest windows`: VMs use the binaries it publishes to `C:\ProgramData\fc-sandbox-win\bin\egress\`, not the ones in the repository's build folders.
 
@@ -417,6 +498,9 @@ Repository layout:
 | [host/provision.sh](host/provision.sh) | Provisions the Linux distro (packages, binaries, images, controller) |
 | [host/bin/fcctl](host/bin/fcctl), [host/lib/](host/lib/) | Linux-side controller |
 | [images/build-rootfs.sh](images/build-rootfs.sh) | Builds the base Linux guest image |
+| [images/build-agent-rootfs.sh](images/build-agent-rootfs.sh), [images/agent/](images/agent/) | Builds the agent image (Node.js, Claude Code, Codex, the `fc-agent` wrapper) |
+| [gateway/](gateway/) | LLM gateway `fc-llm-gateway` (`FcGateway`) and tests |
+| [host/agents/profiles.json](host/agents/profiles.json), [host/lib/agent.sh](host/lib/agent.sh) | Agent profiles and the controller's agent and gateway handling |
 | [samples/hello/](samples/hello/), [samples/hello-win/](samples/hello-win/) | Sample payloads for Linux and Windows guests |
 | [tests/smoke/](tests/smoke/), [tests/smoke-win/](tests/smoke-win/) | End-to-end smoke tests for Linux and Windows microVMs |
 | [openspec/](openspec/) | Specifications and design/planning documents |
