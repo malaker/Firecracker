@@ -44,7 +44,7 @@
 
 ## 8. Integration
 
-- [ ] 8.1 Run the full Linux smoke suite, `dotnet test` for `gateway`, `mcp` and `airlock`, `dotnet test mcp` again with `FC_MCP_INTEGRATION=1` (the recipe integration tests from 7.2), the MCP smoke script and `openspec validate sandbox-recipes --strict`; verify all pass on a host set up from scratch with `.\fc.ps1 setup`. `dotnet test windows\egress` is not part of this check because the change does not touch the egress proxy
+- [x] 8.1 Run the full Linux smoke suite, `dotnet test` for `gateway`, `mcp` and `airlock`, `dotnet test mcp` again with `FC_MCP_INTEGRATION=1` (the recipe integration tests from 7.2), the MCP smoke script and `openspec validate sandbox-recipes --strict`; verify all pass on a host set up from scratch with `.\fc.ps1 setup`. `dotnet test windows\egress` is not part of this check because the change does not touch the egress proxy
 
 ## Workflow follow-up
 

@@ -44,6 +44,8 @@ flowchart LR
 - **Two network modes.** `isolated` has no network device at all. `networked` has controlled egress with the host and private ranges blocked, plus an optional destination allowlist: NAT-ed through nftables for Linux guests, and through a host-side egress proxy for Windows guests, which still have no network adapter.
 - **Simple results.** Each run's exit code, stdout/stderr, metadata and output files are collected into `runs\<run-id>\` on Windows.
 - **Agents in the sandbox.** Run Claude Code or Codex (OpenAI or a local Ollama) inside a Linux microVM with a task prompt, to analyse a payload or probe the sandbox from the inside. In the default gateway mode the VM has no network and the API key stays on the host. See [Agents in the sandbox](#agents-in-the-sandbox--agent).
+- **Ready-made recipes.** One command each for common security tasks on Linux guests: self-tests of the sandbox, static triage and detonation of a sample, npm and pip install checks, and agent-driven escape tests and triage. Each recipe fixes its own command, image and network mode and writes a report. See [Recipes](#recipes-fcps1-recipe).
+- **MCP server.** An agent on the host can send risky work into disposable VMs through a fixed set of sandbox tools, with no way to act on the host itself. See [MCP server](#mcp-server-fcps1-mcp).
 - **Guest output airlock.** Output files never reach the host by unpacking a guest's archive: a fresh airlock VM validates and re-encodes them, and the host checks the result again without admin rights before writing anything. Links, devices, unsafe names and oversized output are refused. See [Guest output airlock](#guest-output-airlock).
 
 ## Requirements
@@ -93,10 +95,11 @@ The default image repository, `malaker/nanoserver`, is not published on Docker H
 3. Runs `host/provision.sh` inside `fc-host`, which:
    - installs the required packages and downloads the pinned Firecracker/jailer release, guest kernel and Ubuntu image (versions and SHA-256 sums are in [host/versions.env](host/versions.env)). A checksum mismatch stops setup and names the file.
    - builds the base disk image, generates the controller's SSH key, enables IP forwarding and creates the nftables table.
-   - installs the controller into `/opt/fc-sandbox`.
+   - builds the [agent image](#agents-in-the-sandbox--agent) with its analysis tools (skipped with `-NoAgentImage`) and the LLM gateway.
+   - installs the controller and the [recipes](#recipes-fcps1-recipe) into `/opt/fc-sandbox`.
 4. Runs `.\fc.ps1 doctor`.
 
-A repeated run downloads nothing and reports `all components are up to date`. After changing anything under `host/` or `images/`, re-run setup to copy the updated controller into the distro.
+A repeated run downloads nothing and reports `all components are up to date`. After changing anything under `host/`, `images/` or `recipes/`, re-run setup to copy the updated controller into the distro.
 
 ### Windows Nano Server setup (`.\fc.ps1 setup -Guest windows [options]`)
 
@@ -498,10 +501,14 @@ A recipe is a folder under [recipes/](recipes/) with a `recipe.json` manifest an
 | `kind` | `command` (runs `command`) or `agent` (runs an agent with the prompt file named in `prompt`; needs `image: agent` and `net: isolated`) |
 | `image` | `base`, or `agent` for the image with the [analysis tools](#agents-in-the-sandbox--agent) |
 | `net` | `isolated` or `networked` |
-| `input` | `sample`, `package`, `rules` and `entry`, each `none` (default), `optional` or `required`. `"require_one_of": ["sample", "package"]` asks for exactly one of the two |
+| `input` | `sample`, `package`, `rules` and `entry`, each `none` (default), `optional` or `required` |
+| `require_one_of` | Optional, next to `input` (not inside it): `["sample", "package"]` asks for exactly one of the two; set both to `optional` in `input` |
+| `host_facts` | Optional, `true` for self-tests: adds the addresses the guest cannot know to `recipe.env` (see below) |
 | `timeout`, `vcpu`, `mem_mib` | Optional defaults for the run |
 
-Inside the guest the recipe's folder is at `/work/recipe` (shared helpers from `recipes/_lib` at `/work/recipe/_lib`), the sample at `/work/in`, the rules at `/work/rules`, and `/work/.fc/recipe.env` holds `FC_RECIPE`, `FC_RECIPE_SAMPLE_KIND` (`none`, `file` or `dir`), `FC_RECIPE_SAMPLE` (the file name), `FC_RECIPE_PACKAGE`, `FC_RECIPE_ENTRY` and `FC_RECIPE_RULES` (`1` or `0`). Whatever the recipe writes to `/work/out` is collected.
+Any other field makes the manifest invalid.
+
+Inside the guest the recipe's folder is at `/work/recipe` (shared helpers from `recipes/_lib` at `/work/recipe/_lib`), the sample at `/work/in`, the rules at `/work/rules`, and `/work/.fc/recipe.env` holds `FC_RECIPE`, `FC_RECIPE_SAMPLE_KIND` (`none`, `file` or `dir`), `FC_RECIPE_SAMPLE` (the file name), `FC_RECIPE_PACKAGE`, `FC_RECIPE_ENTRY` and `FC_RECIPE_RULES` (`1` or `0`). With `host_facts` it also holds `FC_HOST_WSL` (`fc-host`'s address), `FC_HOST_WINDOWS` (the Windows host as WSL sees it) and `FC_VM_RANGE` (the microVM address range). Whatever the recipe writes to `/work/out` is collected.
 
 ## MCP server (`fc.ps1 mcp`)
 
@@ -650,7 +657,7 @@ Repository layout:
 | [host/provision.sh](host/provision.sh) | Provisions the Linux distro (packages, binaries, images, controller) |
 | [host/bin/fcctl](host/bin/fcctl), [host/lib/](host/lib/) | Linux-side controller |
 | [images/build-rootfs.sh](images/build-rootfs.sh) | Builds the base Linux guest image |
-| [images/build-agent-rootfs.sh](images/build-agent-rootfs.sh), [images/agent/](images/agent/) | Builds the agent image (Node.js, Claude Code, Codex, the `fc-agent` wrapper) |
+| [images/build-agent-rootfs.sh](images/build-agent-rootfs.sh), [images/agent/](images/agent/) | Builds the agent image (Node.js, Claude Code, Codex, the `fc-agent` wrapper, the analysis tools) |
 | [gateway/](gateway/) | LLM gateway `fc-llm-gateway` (`FcGateway`) and tests |
 | [recipes/](recipes/), [host/lib/recipe.sh](host/lib/recipe.sh) | The ready-made recipes (manifest and scripts per recipe, shared helpers in `_lib`) and the controller's `recipe` command |
 | [images/agent/tools.lock](images/agent/tools.lock) | Checksum-pinned analysis tool packages for the agent image |
