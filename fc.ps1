@@ -11,6 +11,8 @@
   .\fc.ps1 run -Guest windows -Payload .\samples\hello-win -Cmd '.\in\hello.cmd'
   .\fc.ps1 run -Payload .\tests -Cmd './in/scan.sh' -Net networked -Allow 203.0.113.0/24 -Timeout 10m
   .\fc.ps1 shell -Net networked
+  .\fc.ps1 recipe list
+  .\fc.ps1 recipe triage-static -Sample C:\quarantine\x.bin
   .\fc.ps1 list
   .\fc.ps1 stop <run-id>
   .\fc.ps1 cleanup
@@ -18,7 +20,7 @@
 [CmdletBinding(PositionalBinding = $false)]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('setup', 'doctor', 'run', 'shell', 'start', 'ssh', 'put', 'get', 'list', 'stop', 'cleanup', 'mcp', 'help')]
+    [ValidateSet('setup', 'doctor', 'run', 'shell', 'start', 'ssh', 'put', 'get', 'list', 'stop', 'cleanup', 'mcp', 'recipe', 'help')]
     [string]$Command = 'help',
 
     # run-id for stop/ssh/put/get, followed by a command (ssh), a host path (put) or a guest path (get).
@@ -71,7 +73,15 @@ param(
     [string]$PromptFile,
     [string]$Model,
     [switch]$AgentDirect,
-    [long]$AgentTokenBudget
+    [long]$AgentTokenBudget,
+
+    # recipe <name>|list: the file or folder to examine, a package spec (package checks), a folder
+    # of YARA rules, the file to execute inside a folder sample; -Json for 'recipe list'.
+    [string]$Sample,
+    [string]$Package,
+    [string]$Rules,
+    [string]$Entry,
+    [switch]$Json
 )
 
 $ErrorActionPreference = 'Stop'
@@ -132,6 +142,11 @@ if ($Guest -eq 'linux') {
 
 if ($Agent -and $Guest -eq 'windows') {
     [Console]::Error.WriteLine("[fc] ERROR: agents need Linux guests (-Guest linux); Windows guests are not supported for -Agent.")
+    exit 125
+}
+
+if ($Command -eq 'recipe' -and $Guest -eq 'windows') {
+    [Console]::Error.WriteLine("[fc] ERROR: recipes need Linux guests (-Guest linux); Windows guests are not supported.")
     exit 125
 }
 
@@ -243,7 +258,26 @@ if ($MemMib)  { $argv.Add('--mem'); $argv.Add("$MemMib") }
 if ($Timeout) { $argv.Add('--timeout'); $argv.Add($Timeout) }
 if ($Keep)    { $argv.Add('--keep') }
 if ($Boot)    { $argv.Add('--boot') }
-if ($Command -eq 'run') {
+# Recipe inputs (spec: sandbox-recipes). The sample is uploaded from where it lies; fcctl checks
+# which inputs the recipe takes.
+if ($Sample) {
+    if (-not (Test-Path -LiteralPath $Sample)) {
+        [Console]::Error.WriteLine("[fc] ERROR: sample '$Sample' not found.")
+        exit 125
+    }
+    $argv.Add('--sample'); $argv.Add((ConvertTo-WslPath $Sample))
+}
+if ($Rules) {
+    if (-not (Test-Path -LiteralPath $Rules -PathType Container)) {
+        [Console]::Error.WriteLine("[fc] ERROR: rules folder '$Rules' not found.")
+        exit 125
+    }
+    $argv.Add('--rules'); $argv.Add((ConvertTo-WslPath $Rules))
+}
+if ($PSBoundParameters.ContainsKey('Package')) { $argv.Add('--package'); $argv.Add($Package) }
+if ($PSBoundParameters.ContainsKey('Entry')) { $argv.Add('--entry'); $argv.Add($Entry.Replace('\', '/')) }
+if ($Json) { $argv.Add('--json') }
+if ($Command -in @('run', 'recipe')) {
     $runs = Join-Path $PSScriptRoot 'runs'
     New-Item -ItemType Directory -Force -Path $runs | Out-Null
     $argv.Add('--results-dir'); $argv.Add((ConvertTo-WslPath $runs))
@@ -255,8 +289,8 @@ if ($Command -eq 'run') {
 $keyRef = $null
 $promptTemp = $null
 if ($Agent) {
-    if ($Command -notin @('run', 'shell')) {
-        [Console]::Error.WriteLine("[fc] ERROR: -Agent works with run and shell.")
+    if ($Command -notin @('run', 'shell', 'recipe')) {
+        [Console]::Error.WriteLine("[fc] ERROR: -Agent works with run, shell and recipe.")
         exit 125
     }
     $profiles = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'host\agents\profiles.json') -Raw | ConvertFrom-Json
@@ -266,6 +300,10 @@ if ($Agent) {
         exit 125
     }
     $prof = $prof.Value
+    if ($Command -eq 'recipe' -and ($Prompt -or $PromptFile)) {
+        [Console]::Error.WriteLine("[fc] ERROR: -Prompt and -PromptFile cannot be used with a recipe: the recipe supplies the prompt.")
+        exit 125
+    }
     if ($Command -eq 'run') {
         if ([bool]$Prompt -eq [bool]$PromptFile) {
             [Console]::Error.WriteLine("[fc] ERROR: an agent run needs exactly one of -Prompt or -PromptFile.")

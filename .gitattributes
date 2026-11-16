@@ -8,3 +8,8 @@ host/agents/* text eol=lf
 # PowerShell scripts are stored and checked out byte-for-byte, so a clone gets exactly the
 # committed bytes (and a signature added locally under AllSigned is not broken by git).
 *.ps1 -text
+images/agent/tools.lock text eol=lf
+# Recipes are uploaded into Linux guests as-is.
+recipes/** text eol=lf
+tests/smoke/samples/** text eol=lf
+tests/smoke/recipes-fixture/** text eol=lf

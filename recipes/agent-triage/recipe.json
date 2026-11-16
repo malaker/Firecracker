@@ -1,0 +1,9 @@
+{
+  "description": "An agent examines a sample with the analysis tools, without running it, and reports",
+  "kind": "agent",
+  "image": "agent",
+  "net": "isolated",
+  "prompt": "prompt.md",
+  "input": { "sample": "required", "rules": "optional" },
+  "timeout": "30m", "vcpu": 2, "mem_mib": 2048
+}

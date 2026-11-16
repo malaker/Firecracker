@@ -1,0 +1,9 @@
+{
+  "description": "An agent assesses the sandbox from inside: looks for ways out and reports what it finds",
+  "kind": "agent",
+  "image": "agent",
+  "net": "isolated",
+  "prompt": "prompt.md",
+  "input": {},
+  "timeout": "30m", "vcpu": 2, "mem_mib": 2048
+}

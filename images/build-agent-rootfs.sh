@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Build the agent image: the base image plus pinned Node.js, the agent CLIs and the gateway shim
-# (change: in-sandbox-agents, design D4).
-# Usage (as root): build-agent-rootfs.sh <base.ext4> <node.tar.gz> <agent-dir> <output.ext4> <size>
+# Build the agent image: the base image plus pinned Node.js, the agent CLIs, the gateway shim
+# (change: in-sandbox-agents, design D4) and the analysis tools (change: sandbox-recipes, design D5).
+# Usage (as root): build-agent-rootfs.sh <base.ext4> <node.tar.gz> <agent-dir> <output.ext4> <size> <tools-dir>
 #   agent-dir holds package.json and the committed package-lock.json.
-# Packages are installed with 'npm ci --ignore-scripts', so no package code runs on this host.
+#   tools-dir holds the verified .deb files from tools.lock and pip.whl.
+# Packages are installed with 'npm ci --ignore-scripts' and the .deb files are only unpacked, so
+# no package code runs on this host.
 set -euo pipefail
 
-BASE="$1" NODE_TGZ="$2" AGENT_DIR="$3" OUT="$4" SIZE="$5"
+BASE="$1" NODE_TGZ="$2" AGENT_DIR="$3" OUT="$4" SIZE="$5" TOOLS_DIR="$6"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WORK="$(mktemp -d /var/tmp/fc-agent-rootfs.XXXXXX)"
 MNT="$WORK/mnt"
@@ -57,6 +59,26 @@ exec /opt/node/bin/node /opt/agent/node_modules/@openai/codex/bin/codex.js "$@"
 EOF
 chmod 0755 "$MNT/usr/local/bin/codex"
 install -m 0755 "$HERE/agent/fc-agent" "$MNT/usr/local/bin/fc-agent"
+
+# 4b. Analysis tools: unpack the .deb files (no maintainer scripts; the image has no dpkg
+# database anyway), pip from its wheel, and npm on the path.
+shopt -s nullglob
+debs=("$TOOLS_DIR"/*.deb)
+(( ${#debs[@]} )) || { echo "build-agent-rootfs: no .deb files in $TOOLS_DIR" >&2; exit 1; }
+for deb in "${debs[@]}"; do
+  dpkg-deb -x "$deb" "$MNT"
+done
+ldconfig -r "$MNT"
+rm -rf "$MNT/opt/pip"
+mkdir -p "$MNT/opt/pip"
+unzip -q "$TOOLS_DIR/pip.whl" -d "$MNT/opt/pip"
+printf '#!/bin/sh\nexec python3 /opt/pip/pip "$@"\n' > "$MNT/usr/local/bin/pip"
+chmod 0755 "$MNT/usr/local/bin/pip"
+ln -sf /opt/node/bin/npm "$MNT/usr/local/bin/npm"
+ln -sf /opt/node/bin/npx "$MNT/usr/local/bin/npx"
+for t in usr/bin/file usr/bin/strings usr/bin/readelf usr/bin/objdump usr/bin/yara opt/pip/pip/__main__.py; do
+  [ -e "$MNT/$t" ] || { echo "build-agent-rootfs: $t is missing after unpacking the tools" >&2; exit 1; }
+done
 
 # 5. The guest end of the gateway channel: 127.0.0.1:8080 -> vsock CID 2 (host) port 8080.
 cat > "$MNT/etc/systemd/system/fc-llm-shim.service" <<'EOF'

@@ -1,0 +1,10 @@
+{
+  "description": "Self-test of a networked VM: fails if the hosts, private ranges or other VMs answer",
+  "kind": "command",
+  "image": "base",
+  "net": "networked",
+  "command": "python3 /work/recipe/_lib/probe.py networked",
+  "input": {},
+  "host_facts": true,
+  "timeout": "5m", "vcpu": 1, "mem_mib": 512
+}

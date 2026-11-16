@@ -79,39 +79,45 @@ public sealed partial class SandboxTools(ServerOptions options, ICliRunner runne
             named["RunInfoFile"] = info;
             var limit = TimeSpan.FromSeconds(ParseDuration(timeout ?? "30m") + 900);
             var r = await runner.RunAsync("run", [], named, Path.Combine(work, "cli.out"), Path.Combine(work, "cli.err"), limit, cancel);
-
-            if (!File.Exists(info)) return Fail("the run did not start", Path.Combine(work, "cli.err"));
-            var runInfo = JsonNode.Parse(File.ReadAllText(info))!;
-            string runId = (string)runInfo["run_id"]!;
-            string resultsDir = (string)runInfo["results_dir"]!;
-            var meta = ReadJson(Path.Combine(resultsDir, "meta.json"));
-
-            var result = new JsonObject
-            {
-                ["run_id"] = runId,
-                ["exit_code"] = meta?["exit_code"]?.DeepClone() ?? r.ExitCode,
-                ["timed_out"] = meta?["timed_out"]?.DeepClone() ?? r.TimedOut,
-                ["results_dir"] = resultsDir,
-                ["stdout_path"] = Path.Combine(resultsDir, "stdout.log"),
-                ["stderr_path"] = Path.Combine(resultsDir, "stderr.log"),
-                ["output_files"] = ListFiles(Path.Combine(resultsDir, "out")),
-                ["collection"] = meta?["collection"]?.DeepClone(),
-            };
-            if (isAgent)
-            {
-                // The transcript is guest-produced: returned as a path, never inlined.
-                result["agent"] = meta?["agent"]?.DeepClone();
-                result["transcript_path"] = Path.Combine(resultsDir, "out", "agent-transcript.jsonl");
-                result["llm_log_path"] = Path.Combine(resultsDir, "llm.log");
-            }
-            return Ok(result, $"run {runId} finished with exit code {result["exit_code"]}",
-                ("stdout", OutputShaper.ReadBounded(Path.Combine(resultsDir, "stdout.log"))),
-                ("stderr", OutputShaper.ReadBounded(Path.Combine(resultsDir, "stderr.log"))));
+            return RunResult(work, r, info, isAgent, "run");
         }
         catch (PolicyException ex)
         {
             return Error(ex.Message);
         }
+    }
+
+    /// <summary>The result of a finished one-shot run (sandbox_run, sandbox_recipe), read from its result folder.</summary>
+    private static CallToolResult RunResult(string work, CliResult r, string info, bool isAgent, string what, Action<JsonObject, JsonNode?, string>? extend = null)
+    {
+        if (!File.Exists(info)) return Fail($"the {what} did not start", Path.Combine(work, "cli.err"));
+        var runInfo = JsonNode.Parse(File.ReadAllText(info))!;
+        string runId = (string)runInfo["run_id"]!;
+        string resultsDir = (string)runInfo["results_dir"]!;
+        var meta = ReadJson(Path.Combine(resultsDir, "meta.json"));
+
+        var result = new JsonObject
+        {
+            ["run_id"] = runId,
+            ["exit_code"] = meta?["exit_code"]?.DeepClone() ?? r.ExitCode,
+            ["timed_out"] = meta?["timed_out"]?.DeepClone() ?? r.TimedOut,
+            ["results_dir"] = resultsDir,
+            ["stdout_path"] = Path.Combine(resultsDir, "stdout.log"),
+            ["stderr_path"] = Path.Combine(resultsDir, "stderr.log"),
+            ["output_files"] = ListFiles(Path.Combine(resultsDir, "out")),
+            ["collection"] = meta?["collection"]?.DeepClone(),
+        };
+        if (isAgent)
+        {
+            // The transcript is guest-produced: returned as a path, never inlined.
+            result["agent"] = meta?["agent"]?.DeepClone();
+            result["transcript_path"] = Path.Combine(resultsDir, "out", "agent-transcript.jsonl");
+            result["llm_log_path"] = Path.Combine(resultsDir, "llm.log");
+        }
+        extend?.Invoke(result, meta, resultsDir);
+        return Ok(result, $"{what} {runId} finished with exit code {result["exit_code"]}",
+            ("stdout", OutputShaper.ReadBounded(Path.Combine(resultsDir, "stdout.log"))),
+            ("stderr", OutputShaper.ReadBounded(Path.Combine(resultsDir, "stderr.log"))));
     }
 
     [McpServerTool(Name = "sandbox_start"), Description(

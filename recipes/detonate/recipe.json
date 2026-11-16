@@ -1,0 +1,9 @@
+{
+  "description": "Runs a sample under strace in an isolated VM: processes, file changes, connection attempts",
+  "kind": "command",
+  "image": "agent",
+  "net": "isolated",
+  "command": "python3 /work/recipe/detonate.py 120",
+  "input": { "sample": "required", "entry": "optional" },
+  "timeout": "10m", "vcpu": 2, "mem_mib": 1024
+}

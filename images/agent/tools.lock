@@ -1,0 +1,20 @@
+# Analysis tool packages for the agent image (change: sandbox-recipes, design D5).
+# One line per .deb: <sha256> <path below TOOLS_SNAPSHOT_URL in host/versions.env>.
+# The files are unpacked into the image with 'dpkg-deb -x'; no package script runs.
+# To update: pick a new TOOLS_SNAPSHOT, take paths and SHA256 from 'apt-cache show <pkg>'
+# (Filename, SHA256) on Ubuntu 24.04, and include every library the base image lacks.
+17dae1d6e803d0304e318f451c8abf62cbd5bb2a0068300cdeea77c62075b895 pool/main/f/file/file_5.45-3build1_amd64.deb
+fc2319f342c437e044ccf854e0c95bd472a7eb0b9363e1f76ad1524ab04df68e pool/main/f/file/libmagic1t64_5.45-3build1_amd64.deb
+f0ed0e314a63ae1b7e5403d7e43a26c6e0c0ee69e9a305babcf9c6775607377a pool/main/f/file/libmagic-mgc_5.45-3build1_amd64.deb
+b3b5a84181a38fd191820b2cdcc1a3eeb1cd6333ad472f2092f96e81047e9c74 pool/main/b/binutils/binutils_2.42-4ubuntu2.10_amd64.deb
+d136073f5e2153f3df11c1d08d66727b9466b28ff483f50085f14bbe3464b5ee pool/main/b/binutils/binutils-common_2.42-4ubuntu2.10_amd64.deb
+064dce00ce94e1fc2d33779cb0071088f4c8aac79e85345f2e78a020f7d14699 pool/main/b/binutils/libbinutils_2.42-4ubuntu2.10_amd64.deb
+1e510a15f30208d39edcd840e48f26a77bbca7c417805eeccb1e3f7de198ef29 pool/main/b/binutils/binutils-x86-64-linux-gnu_2.42-4ubuntu2.10_amd64.deb
+7ec86d697c3668503c85f308a6832f092075b5880ad002f22185264da0bd4645 pool/main/b/binutils/libctf0_2.42-4ubuntu2.10_amd64.deb
+da352eb7fa6c4369d2a6c1e5e680f574eda2e38576563326b18d9e47e61c4078 pool/main/b/binutils/libctf-nobfd0_2.42-4ubuntu2.10_amd64.deb
+1b7e3c2fc162e8358ca6e5a3fffdb4d0d632f790630323215841bb36a63c0ab8 pool/main/b/binutils/libgprofng0_2.42-4ubuntu2.10_amd64.deb
+72093fb456864db55f1352bfa5e952a94f7abaff64e71dff1fbf001db1984564 pool/main/b/binutils/libsframe1_2.42-4ubuntu2.10_amd64.deb
+0cf79113f5d193ce9af2be2ff4b2c3b30dd4e55a0b6c47f7d28f6c849ff3aa60 pool/main/j/jansson/libjansson4_2.14-2build2_amd64.deb
+059a27ae4a148773bf4a360d573c82c43afb673d84c3413d934492301a2aecc3 pool/universe/y/yara/yara_4.5.0-1build2_amd64.deb
+b1cec78e0bd6ffe14019691785d774dc1f520bf9fa3065d9265fb8cc9910f698 pool/universe/y/yara/libyara10_4.5.0-1build2_amd64.deb
+577b713651a61e82226e46c9c9e3c23cd16df9ee3c2b27b22b49c5abb2ef8f61 pool/main/p/protobuf-c/libprotobuf-c1_1.4.1-1ubuntu4_amd64.deb

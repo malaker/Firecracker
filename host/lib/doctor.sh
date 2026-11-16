@@ -27,6 +27,7 @@ _mem()           { (( $(awk '/^MemAvailable:/ {print $2}' /proc/meminfo) >= 1536
 _agent_image()   { [ -f "$FC_AGENT_ROOTFS" ] && [ -f "$FC_AGENT_ROOTFS.stamp" ]; }
 _gateway()       { [ -x "$FC_GATEWAY_BIN" ] && "$FC_GATEWAY_BIN" --version | grep -q '^fc-llm-gateway ' && [ -f "$FC_AGENTS/profiles.json" ]; }
 _airlock()       { [ -x "$FC_HOME/bin/fc-airlock" ] && "$FC_HOME/bin/fc-airlock" --version | grep -q '^fc-airlock '; }
+_recipes()       { [ -n "$(recipe_names)" ] && [ -z "$(recipe_invalid_names)" ]; }
 
 _boot() {
   local id slot rc=0
@@ -51,6 +52,7 @@ doctor() {
   check "guest output airlock tool (fc-airlock)" "rerun 'fc.ps1 setup' (needs the .NET 10 SDK)" _airlock
   check "agent image (-Agent runs)"      "rerun 'fc.ps1 setup' (without -NoAgentImage)" _agent_image
   check "LLM gateway (fc-llm-gateway)"    "rerun 'fc.ps1 setup' (needs the .NET 10 SDK)" _gateway
+  check "recipes installed and valid"     "rerun 'fc.ps1 setup'$(bad="$(recipe_invalid_names 2>/dev/null)"; [ -z "$bad" ] || echo "; invalid manifest in: $bad")" _recipes
   # Ollama is optional: only the codex-ollama profile needs it.
   local ollama; ollama="$(agent_ollama_url)"
   if [ -n "$ollama" ] && curl -fsS -m 3 -o /dev/null "$ollama/api/version" 2>/dev/null; then

@@ -1,0 +1,2 @@
+{ "description": "Fixture: agent recipe", "kind": "agent", "image": "agent", "net": "isolated",
+  "prompt": "prompt.md", "input": { "sample": "optional" } }

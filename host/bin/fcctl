@@ -3,7 +3,7 @@
 set -euo pipefail
 
 FC_HOME="${FC_HOME:-$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)}"
-for f in common state ssh net vm airlock agent doctor; do
+for f in common state ssh net vm airlock agent recipe doctor; do
   # shellcheck source=/dev/null
   . "$FC_HOME/lib/$f.sh"
 done
@@ -26,6 +26,10 @@ Commands:
   get <run-id> <guest-path> <local-dir>
                              Copy a guest file or folder out of a started VM through the
                              airlock into an empty or new local-dir (exit 1 if refused)
+  recipe list [--json]       List the ready-made recipes
+  recipe <name> [recipe options] [--timeout DUR] [--vcpu N] [--mem MIB] [--keep]
+                             Run a recipe: a run whose command, image and network mode are
+                             fixed by the recipe's manifest (recipes/<name>/recipe.json)
   list                       List VMs (running, dead or kept)
   stop <run-id>              Destroy a VM (a kept VM's disk is removed too)
   cleanup                    Destroy every VM and remove all leftovers from earlier runs
@@ -47,6 +51,13 @@ Agent options (run and shell; Linux guests):
   --token-budget N           Gateway token budget for this run (default from profiles.json)
   --key-ref REF              API key stashed with '_stash-key REF' (fc.ps1 does this)
 
+Recipe options (which ones a recipe takes is in 'recipe list'):
+  --sample PATH              The file or folder to examine; uploaded to /work/in
+  --package SPEC             A package name with an optional version (package check recipes)
+  --rules DIR                A folder of YARA rules; uploaded to /work/rules
+  --entry FILE               The file to execute inside a folder sample
+  --agent PROFILE            Agent recipes: the agent profile (gateway mode only)
+
 Exit codes (run): the guest command's exit code, 124 on timeout, 125 on sandbox failure.
 EOF
 }
@@ -56,10 +67,20 @@ OPT_NET=isolated OPT_ALLOW="" OPT_VCPU=$DEFAULT_VCPU OPT_MEM=$DEFAULT_MEM_MIB
 OPT_TIMEOUT=$DEFAULT_TIMEOUT OPT_KEEP=0 OPT_PAYLOAD="" OPT_CMD="" OPT_RESULTS="$FC_RESULTS_DEFAULT"
 OPT_BOOT=0 OPT_RUN_INFO="" OPT_IMAGE=base POSITIONAL=()
 OPT_AGENT="" OPT_PROMPT_FILE="" OPT_MODEL="" OPT_AGENT_DIRECT=0 OPT_TOKEN_BUDGET="" OPT_KEY_REF=""
+OPT_GIVEN=" " CMD=""
+
+# opt_given <--option>: whether the option was on the command line (recipes fix some settings).
+opt_given() { [[ "$OPT_GIVEN" == *" $1 "* ]]; }
 
 parse_opts() {
   while (( $# )); do
+    case "$1" in --*) OPT_GIVEN+="$1 " ;; esac
     case "$1" in
+      --sample)      OPT_SAMPLE="$2"; shift ;;
+      --package)     OPT_PACKAGE="$2"; shift ;;
+      --rules)       OPT_RULES="$2"; shift ;;
+      --entry)       OPT_ENTRY="$2"; shift ;;
+      --json)        OPT_JSON=1 ;;
       --net)         OPT_NET="$2"; shift ;;
       --allow)       OPT_ALLOW="$2"; shift ;;
       --vcpu)        OPT_VCPU="$2"; shift ;;
@@ -100,6 +121,12 @@ parse_opts() {
     done
   fi
   (( OPT_TIMEOUT > 0 )) || die "--timeout must be positive"
+  if [ "$CMD" = recipe ]; then
+    recipe_check_opts
+    [ "${POSITIONAL[0]:-}" != list ] || return 0
+  elif [ -n "$OPT_SAMPLE$OPT_PACKAGE$OPT_RULES$OPT_ENTRY" ]; then
+    die "--sample, --package, --rules and --entry need the recipe command"
+  fi
   if [ -n "$OPT_AGENT" ]; then
     agent_check_opts
   elif (( OPT_AGENT_DIRECT )) || [ -n "$OPT_PROMPT_FILE$OPT_MODEL$OPT_TOKEN_BUDGET" ]; then
@@ -119,9 +146,10 @@ cmd_run() {
     [ -z "$OPT_CMD" ] || die "use either --cmd or --agent, not both"
     [ -n "$OPT_PROMPT_FILE" ] && [ -s "$OPT_PROMPT_FILE" ] || die "an agent run needs a non-empty --prompt-file"
     (( $(stat -c %s "$OPT_PROMPT_FILE") <= 1048576 )) || die "the prompt is larger than 1 MiB"
-    [ -z "$OPT_PAYLOAD" ] || [ -d "$OPT_PAYLOAD" ] || die "payload directory '$OPT_PAYLOAD' not found"
+    [ -n "$OPT_RECIPE" ] || [ -z "$OPT_PAYLOAD" ] || [ -d "$OPT_PAYLOAD" ] || die "payload directory '$OPT_PAYLOAD' not found"
     OPT_CMD="fc-agent headless"
-  else
+  elif [ -z "$OPT_RECIPE" ]; then
+    # (A recipe's command and input were checked by recipe_check_opts.)
     [ -n "$OPT_CMD" ] || die "run needs --cmd"
     [ -n "$OPT_PAYLOAD" ] && [ -d "$OPT_PAYLOAD" ] || die "payload directory '$OPT_PAYLOAD' not found"
   fi
@@ -139,7 +167,9 @@ cmd_run() {
   meta_set_str "$VM_ID" results_dir "$out"
   [ -z "$OPT_RUN_INFO" ] || write_run_info "$OPT_RUN_INFO" "$out"
 
-  if [ -n "$OPT_PAYLOAD" ] && ! upload_dir "$VM_ID" "$OPT_PAYLOAD" /work/in; then
+  if [ -n "$OPT_RECIPE" ] && ! recipe_prepare_guest "$VM_ID"; then
+    rc=$EXIT_INFRA error="could not upload the recipe or its input"
+  elif [ -z "$OPT_RECIPE" ] && [ -n "$OPT_PAYLOAD" ] && ! upload_dir "$VM_ID" "$OPT_PAYLOAD" /work/in; then
     rc=$EXIT_INFRA error="payload upload failed"
   elif [ -n "$OPT_AGENT" ] && ! agent_prepare_guest "$VM_ID" "$OPT_PROMPT_FILE"; then
     rc=$EXIT_INFRA error="could not prepare the agent in the guest"
@@ -212,13 +242,14 @@ write_run_meta() {
     --argjson timeout "$OPT_TIMEOUT" --arg started "$2" --arg ended "$(now_iso)" \
     --argjson rc "$3" --argjson timed_out "$4" --arg error "$5" \
     --arg fc "${FC_VERSION:-}" --argjson keep "$OPT_KEEP" --argjson collection "${6:-null}" \
-    --argjson agent "${7:-null}" \
+    --argjson agent "${7:-null}" --argjson recipe "${RECIPE_META_JSON:-null}" \
     '{run_id:$id, command:$cmd, payload:$payload, net:$net, allow:$allow, vcpu:$vcpu,
       mem_mib:$mem, timeout_sec:$timeout, started_at:$started,
       ended_at:(if $rc == null then null else $ended end),
       exit_code:$rc, timed_out:$timed_out, error:(if $error == "" then null else $error end),
       keep_disk:($keep==1), firecracker:$fc, collection:$collection}
-     + (if $agent == null then {} else {agent:$agent} end)' > "$1/meta.json"
+     + (if $agent == null then {} else {agent:$agent} end)
+     + (if $recipe == null then {} else {recipe:$recipe} end)' > "$1/meta.json"
 }
 
 # `timeout` runs fc_ssh through `bash -c`, which needs these exported.
@@ -389,10 +420,12 @@ main() {
   local cmd="${1:-}"; shift || true
   case "$cmd" in ""|-h|--help|help) usage; exit 0 ;; esac
   require_root
+  CMD="$cmd"
   parse_opts "$@"
   case "$cmd" in
     doctor)  doctor "$OPT_BOOT" ;;
     run)     cmd_run ;;
+    recipe)  cmd_recipe ;;
     shell)   cmd_shell ;;
     start)   cmd_start ;;
     ssh)     cmd_ssh ;;

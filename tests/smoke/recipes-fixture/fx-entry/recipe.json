@@ -1,0 +1,3 @@
+{ "description": "Fixture: folder sample with an entry", "kind": "command", "image": "base", "net": "isolated",
+  "command": ". /work/.fc/recipe.env; echo \"entry=$FC_RECIPE_ENTRY\" > /work/out/report.md",
+  "input": { "sample": "required", "entry": "optional" } }
