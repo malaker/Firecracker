@@ -1,0 +1,9 @@
+{
+  "description": "Examines a sample without running it: hashes, type, strings, headers, YARA",
+  "kind": "command",
+  "image": "agent",
+  "net": "isolated",
+  "command": "python3 /work/recipe/triage.py",
+  "input": { "sample": "required", "rules": "optional" },
+  "timeout": "10m", "vcpu": 2, "mem_mib": 1024
+}

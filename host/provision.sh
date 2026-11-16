@@ -30,7 +30,7 @@ say()     { printf '[provision] %s\n' "$*"; }
 changed() { CHANGED=1; say "$*"; }
 
 # --- packages ---------------------------------------------------------------
-PKGS=(ca-certificates curl jq nftables socat openssh-client e2fsprogs squashfs-tools iproute2)
+PKGS=(ca-certificates curl jq nftables socat openssh-client e2fsprogs squashfs-tools iproute2 unzip)
 missing=()
 for p in "${PKGS[@]}"; do
   dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "install ok installed" || missing+=("$p")
@@ -97,21 +97,33 @@ if [ ! -f "$FC_HOME/images/rootfs.ext4" ] || [ "$(cat "$FC_HOME/images/rootfs.ex
 fi
 
 # --- agent image (in-sandbox-agents) ----------------------------------------
-# Rebuilt when the base image, Node.js, the agent lockfile, the build script, the guest wrapper or
-# the size changes. A failed build (bad checksum, missing package) keeps the previous image.
+# Rebuilt when the base image, Node.js, the agent lockfile, the analysis tool lock file, pip, the
+# build script, the guest wrapper or the size changes. A failed build (bad checksum, missing
+# package) keeps the previous image.
 if (( NO_AGENT_IMAGE )); then
-  say "skipping the agent image (--no-agent-image); -Agent runs are unavailable"
+  say "skipping the agent image (--no-agent-image); -Agent runs and the recipes that need its tools are unavailable"
 else
   agent_stamp="$(cat "$FC_HOME/images/rootfs.ext4.stamp") $NODE_SHA256"
-  for f in images/agent/package-lock.json images/build-agent-rootfs.sh images/agent/fc-agent; do
+  for f in images/agent/package-lock.json images/build-agent-rootfs.sh images/agent/fc-agent images/agent/tools.lock; do
     agent_stamp+=" $(sha256sum < "$REPO/$f" | cut -c1-16)"
   done
-  agent_stamp+=" $AGENT_ROOTFS_SIZE"
+  agent_stamp+=" $AGENT_ROOTFS_SIZE $TOOLS_SNAPSHOT $PIP_SHA256"
   if [ ! -f "$FC_HOME/images/agent-rootfs.ext4" ] || [ "$(cat "$FC_HOME/images/agent-rootfs.ext4.stamp" 2>/dev/null)" != "$agent_stamp" ]; then
     node="$(fetch "$NODE_URL" "$NODE_SHA256")"
-    changed "building the agent image (Node.js $NODE_VERSION + agent clients; downloads several hundred MB)"
+    # Analysis tools (sandbox-recipes): every .deb in tools.lock and the pip wheel, verified.
+    tools="$CACHE/agent-tools"; rm -rf "$tools"; mkdir -p "$tools"
+    while read -r sum path; do
+      case "$sum" in ''|'#'*) continue ;; esac
+      [[ "$sum" =~ ^[0-9a-f]{64}$ && "$path" =~ ^pool/[A-Za-z0-9+._/-]+\.deb$ ]] \
+        || { say "invalid line in images/agent/tools.lock: $sum $path" >&2; exit 1; }
+      deb="$(fetch "$TOOLS_SNAPSHOT_URL/$path" "$sum")"
+      cp "$deb" "$tools/"
+    done < <(sed 's/\r$//' "$REPO/images/agent/tools.lock")
+    cp "$(fetch "$PIP_URL" "$PIP_SHA256")" "$tools/pip.whl"
+    changed "building the agent image (Node.js $NODE_VERSION, agent clients, analysis tools; downloads several hundred MB)"
     bash "$REPO/images/build-agent-rootfs.sh" "$FC_HOME/images/rootfs.ext4" "$node" "$REPO/images/agent" \
-      "$FC_HOME/images/agent-rootfs.ext4" "$AGENT_ROOTFS_SIZE"
+      "$FC_HOME/images/agent-rootfs.ext4" "$AGENT_ROOTFS_SIZE" "$tools"
+    rm -rf "$tools"
     echo "$agent_stamp" > "$FC_HOME/images/agent-rootfs.ext4.stamp"
     changed "built agent image"
   fi
@@ -153,6 +165,18 @@ if [ -n "$OLLAMA_URL" ]; then
     mv "$FC_HOME/agents/local.env.tmp" "$FC_HOME/agents/local.env"; changed "set the Ollama URL to $OLLAMA_URL"
   else
     rm -f "$FC_HOME/agents/local.env.tmp"
+  fi
+fi
+# Recipes (spec: kvm-host-setup / Recipes installed with the controller): the installed tree is
+# replaced whenever it differs from the repository's, so removed files go away too.
+if [ -d "$REPO/recipes" ]; then
+  if ! diff -qr "$REPO/recipes" "$FC_HOME/recipes" >/dev/null 2>&1; then
+    rm -rf "$FC_HOME/recipes.new"
+    cp -r "$REPO/recipes" "$FC_HOME/recipes.new"
+    chmod -R u=rwX,go=rX "$FC_HOME/recipes.new"
+    rm -rf "$FC_HOME/recipes"
+    mv "$FC_HOME/recipes.new" "$FC_HOME/recipes"
+    changed "updated $FC_HOME/recipes"
   fi
 fi
 # Stashed provider keys and per-VM gateway sockets (design D2/D5).

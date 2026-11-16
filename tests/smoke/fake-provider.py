@@ -9,6 +9,7 @@ the gateway forwarded (path, headers, model). It never talks to the real provide
 Usage: fake-provider.py <port> <requests.jsonl> [reply-text]
 """
 import json
+import os
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,6 +18,8 @@ PORT = int(sys.argv[1])
 LOG = sys.argv[2]
 REPLY = sys.argv[3] if len(sys.argv) > 3 else "FAKE-PROVIDER-REPLY"
 USAGE_IN, USAGE_OUT = 10, 5
+# Seconds to wait before answering a POST, so a test can look inside the VM while the agent waits.
+DELAY = float(os.environ.get("FAKE_PROVIDER_DELAY", "0"))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -69,6 +72,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
         req = self._record(body)
+        time.sleep(DELAY)
         model = req.get("model", "unknown")
         if self.path.startswith("/v1/messages/count_tokens"):
             self._json({"input_tokens": USAGE_IN})

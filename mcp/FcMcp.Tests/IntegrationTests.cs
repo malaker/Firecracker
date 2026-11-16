@@ -118,14 +118,13 @@ public sealed class IntegrationTests : IDisposable
         Assert.Contains(OutputShaper.Notice, Text(link));
     }
 
+
     /// <summary>
-    /// An agent run (Claude Code, gateway mode) against the local fake provider from the smoke tests,
-    /// reached through FC_GATEWAY_TEST_UPSTREAM (passed into WSL with WSLENV). No real API is used.
+    /// Runs <paramref name="body"/> with the smoke tests' local fake provider standing in for the model API:
+    /// the gateway reaches it through FC_GATEWAY_TEST_UPSTREAM (passed into WSL with WSLENV). No real API is used.
     /// </summary>
-    [IntegrationFact]
-    public async Task AgentRunAgainstTheFakeProvider()
+    private static async Task WithFakeProviderAsync(int port, Func<Task> body)
     {
-        const int port = 18091;
         string repoWsl = "/mnt/" + char.ToLowerInvariant(Repo[0]) + Repo[2..].Replace('\\', '/');
         string fpLog = "/tmp/fc-mcp-fake-provider-" + Guid.NewGuid().ToString("N") + ".jsonl";
         using var fp = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("wsl.exe")
@@ -142,19 +141,7 @@ public sealed class IntegrationTests : IDisposable
             Environment.SetEnvironmentVariable("FC_GATEWAY_TEST_UPSTREAM", $"http://127.0.0.1:{port}");
             Environment.SetEnvironmentVariable("WSLENV", string.IsNullOrEmpty(oldWslEnv) ? "FC_GATEWAY_TEST_UPSTREAM" : oldWslEnv + ":FC_GATEWAY_TEST_UPSTREAM");
             Environment.SetEnvironmentVariable("ANTHROPIC_API_KEY", "sk-mcp-integration-fake");
-
-            var r = await _tools.SandboxRun(agent: "claude", prompt: "Say hello; it's a \"test\"", timeout: "4m");
-            Assert.NotEqual(true, r.IsError);
-            var s = S(r);
-            Assert.Equal(0, s.GetProperty("exit_code").GetInt32());
-            var agent = s.GetProperty("agent");
-            Assert.Equal("claude", agent.GetProperty("profile").GetString());
-            Assert.Equal("gateway", agent.GetProperty("mode").GetString());
-            Assert.True(agent.GetProperty("requests").GetInt32() >= 1);
-            string transcript = s.GetProperty("transcript_path").GetString()!;
-            Assert.Contains("FAKE-PROVIDER-REPLY", File.ReadAllText(transcript));
-            Assert.Contains("decision=forwarded", File.ReadAllText(s.GetProperty("llm_log_path").GetString()!));
-            Assert.Contains(OutputShaper.Notice, Text(r));
+            await body();
         }
         finally
         {
@@ -170,4 +157,65 @@ public sealed class IntegrationTests : IDisposable
             kill.WaitForExit(10000);
         }
     }
+
+    /// <summary>An agent run (Claude Code, gateway mode) against the fake provider.</summary>
+    [IntegrationFact]
+    public Task AgentRunAgainstTheFakeProvider() => WithFakeProviderAsync(18091, async () =>
+    {
+        var r = await _tools.SandboxRun(agent: "claude", prompt: "Say hello; it's a \"test\"", timeout: "4m");
+        Assert.NotEqual(true, r.IsError);
+        var s = S(r);
+        Assert.Equal(0, s.GetProperty("exit_code").GetInt32());
+        var agent = s.GetProperty("agent");
+        Assert.Equal("claude", agent.GetProperty("profile").GetString());
+        Assert.Equal("gateway", agent.GetProperty("mode").GetString());
+        Assert.True(agent.GetProperty("requests").GetInt32() >= 1);
+        string transcript = s.GetProperty("transcript_path").GetString()!;
+        Assert.Contains("FAKE-PROVIDER-REPLY", File.ReadAllText(transcript));
+        Assert.Contains("decision=forwarded", File.ReadAllText(s.GetProperty("llm_log_path").GetString()!));
+        Assert.Contains(OutputShaper.Notice, Text(r));
+    });
+
+    /// <summary>Recipes through the tools (spec: sandbox-mcp-tools, recipe tools): the list and a self-test.</summary>
+    [IntegrationFact]
+    public async Task RecipeListAndProbe()
+    {
+        var list = await _tools.SandboxRecipes();
+        Assert.NotEqual(true, list.IsError);
+        var names = S(list).GetProperty("recipes").EnumerateArray().Select(x => x.GetProperty("name").GetString()).ToArray();
+        foreach (string n in new[] { "probe", "probe-net", "triage-static", "detonate", "npm-check", "pip-check", "agent-escape", "agent-triage" })
+        {
+            Assert.Contains(n, names);
+        }
+
+        var r = await _tools.SandboxRecipe("probe");
+        Assert.NotEqual(true, r.IsError);
+        var s = S(r);
+        Assert.Equal(0, s.GetProperty("exit_code").GetInt32());
+        Assert.Equal("probe", s.GetProperty("recipe").GetProperty("name").GetString());
+        Assert.Equal("isolated", s.GetProperty("net").GetString());
+        Assert.Contains("Sandbox self-test", File.ReadAllText(s.GetProperty("report_path").GetString()!));
+        Assert.Equal(0, JsonDocument.Parse(File.ReadAllText(s.GetProperty("report_json_path").GetString()!)).RootElement.GetProperty("summary").GetProperty("fail").GetInt32());
+        Assert.Contains(OutputShaper.Notice, Text(r));
+
+        // This server was started without networked mode: a networked recipe starts nothing.
+        var refused = await _tools.SandboxRecipe("npm-check", package: "left-pad@1.3.0");
+        Assert.True(refused.IsError);
+        Assert.Contains("networked mode is disabled", Text(refused));
+    }
+
+    /// <summary>An agent recipe (agent-triage, Claude Code) against the fake provider, with a sample from an allowed root.</summary>
+    [IntegrationFact]
+    public Task AgentRecipeAgainstTheFakeProvider() => WithFakeProviderAsync(18096, async () =>
+    {
+        var r = await _tools.SandboxRecipe("agent-triage", sample_path: Path.Combine(Repo, "samples", "hello", "hello.sh"), agent: "claude", timeout: "4m");
+        Assert.NotEqual(true, r.IsError);
+        var s = S(r);
+        Assert.Equal(0, s.GetProperty("exit_code").GetInt32());
+        Assert.Equal("agent-triage", s.GetProperty("recipe").GetProperty("name").GetString());
+        Assert.Equal("hello.sh", s.GetProperty("recipe").GetProperty("sample").GetString());
+        Assert.Equal("gateway", s.GetProperty("agent").GetProperty("mode").GetString());
+        Assert.Contains("FAKE-PROVIDER-REPLY", File.ReadAllText(s.GetProperty("transcript_path").GetString()!));
+        Assert.Contains("decision=forwarded", File.ReadAllText(s.GetProperty("llm_log_path").GetString()!));
+    });
 }

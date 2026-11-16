@@ -1,0 +1,9 @@
+{
+  "name": "fc-test-npm-pkg",
+  "version": "0.0.1",
+  "description": "Benign test package for the npm-check recipe: its postinstall script starts a process and writes a file outside the install folder",
+  "license": "MIT",
+  "scripts": {
+    "postinstall": "id > /dev/null && echo marker > /tmp/npm-marker"
+  }
+}

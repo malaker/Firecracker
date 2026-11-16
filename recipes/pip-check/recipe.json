@@ -1,0 +1,10 @@
+{
+  "description": "Installs a Python package under strace: build code, processes, files, connections",
+  "kind": "command",
+  "image": "agent",
+  "net": "networked",
+  "command": "python3 /work/recipe/_lib/pkgcheck.py pip",
+  "input": { "sample": "optional", "package": "optional" },
+  "require_one_of": ["sample", "package"],
+  "timeout": "15m", "vcpu": 2, "mem_mib": 2048
+}

@@ -1,0 +1,3 @@
+{ "description": "Fixture: sample or package", "kind": "command", "image": "base", "net": "isolated",
+  "command": ". /work/.fc/recipe.env; echo \"pkg=$FC_RECIPE_PACKAGE\" > /work/out/report.md",
+  "input": { "sample": "optional", "package": "optional" }, "require_one_of": ["sample", "package"] }

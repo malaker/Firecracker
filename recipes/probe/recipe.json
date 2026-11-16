@@ -1,0 +1,10 @@
+{
+  "description": "Self-test of an isolated VM: fails if anything outside the VM answers",
+  "kind": "command",
+  "image": "base",
+  "net": "isolated",
+  "command": "python3 /work/recipe/_lib/probe.py isolated",
+  "input": {},
+  "host_facts": true,
+  "timeout": "5m", "vcpu": 1, "mem_mib": 512
+}

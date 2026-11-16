@@ -62,8 +62,8 @@ try {
     Send-Rpc 'notifications/initialized' $null -Notify | Out-Null
 
     $tools = @((Send-Rpc 'tools/list' @{}).result.tools | ForEach-Object { $_.name } | Sort-Object)
-    $want = @('sandbox_exec', 'sandbox_get', 'sandbox_list', 'sandbox_put', 'sandbox_run', 'sandbox_start', 'sandbox_stop')
-    Expect "tools/list has exactly the seven sandbox tools" ((($tools -join ',') -eq ($want -join ',')))
+    $want = @('sandbox_exec', 'sandbox_get', 'sandbox_list', 'sandbox_put', 'sandbox_recipe', 'sandbox_recipes', 'sandbox_run', 'sandbox_start', 'sandbox_stop')
+    Expect "tools/list has exactly the nine sandbox tools" ((($tools -join ',') -eq ($want -join ',')))
 
     $payload = if ($Guest -eq 'linux') { 'samples\hello' } else { 'samples\hello-win' }
     $cmd = if ($Guest -eq 'linux') { 'sh ./in/hello.sh' } else { '.\in\hello.cmd' }
@@ -97,6 +97,26 @@ try {
         Expect "agent transcript has the provider's reply" ($agS.transcript_path -and (Select-String -LiteralPath $agS.transcript_path -SimpleMatch 'FAKE-PROVIDER-REPLY' -Quiet))
         Expect "llm.log path is returned" ($agS.llm_log_path -and (Select-String -LiteralPath $agS.llm_log_path -SimpleMatch 'decision=forwarded' -Quiet))
         Expect "agent run output is marked untrusted" ($ag.content[0].text -match 'untrusted output produced inside a sandbox VM')
+
+        # Recipes (Linux guests only): the list, a self-test, and the refusals.
+        $recipes = (Call-Tool 'sandbox_recipes' @{}).structuredContent.recipes
+        $rnames = @($recipes | ForEach-Object { $_.name } | Sort-Object) -join ','
+        Expect "sandbox_recipes lists the eight starter recipes" ($rnames -eq 'agent-escape,agent-triage,detonate,npm-check,pip-check,probe,probe-net,triage-static')
+        $npm = $recipes | Where-Object { $_.name -eq 'npm-check' }
+        Expect "sandbox_recipes says networked recipes are not available here" ($npm.net -eq 'networked' -and $npm.available -match '^no: networked')
+        $probe = Call-Tool 'sandbox_recipe' @{ name = 'probe' }
+        $pS = $probe.structuredContent
+        Expect "sandbox_recipe runs probe (exit 0, isolated)" ($probe.isError -ne $true -and $pS.exit_code -eq 0 -and $pS.recipe.name -eq 'probe' -and $pS.net -eq 'isolated')
+        Expect "sandbox_recipe returns the report paths" ($pS.report_path -and (Select-String -LiteralPath $pS.report_path -SimpleMatch 'Sandbox self-test' -Quiet) -and (Test-Path -LiteralPath $pS.report_json_path))
+        Expect "sandbox_recipe output is marked untrusted" ($probe.content[0].text -match 'untrusted output produced inside a sandbox VM')
+        $tri = Call-Tool 'sandbox_recipe' @{ name = 'triage-static'; sample_path = (Join-Path $RepoRoot 'samples\hello\hello.sh') }
+        Expect "sandbox_recipe uploads a sample from an allowed root" ($tri.isError -ne $true -and $tri.structuredContent.exit_code -eq 0 -and $tri.structuredContent.recipe.sample -eq 'hello.sh')
+        $rnet = Call-Tool 'sandbox_recipe' @{ name = 'npm-check'; package = 'left-pad@1.3.0' }
+        Expect "a networked recipe is refused without -AllowNetworked" ($rnet.isError -eq $true -and $rnet.content[0].text -match 'networked mode is disabled')
+        $rout = Call-Tool 'sandbox_recipe' @{ name = 'triage-static'; sample_path = (Join-Path $env:SystemRoot 'System32\whoami.exe') }
+        Expect "a sample outside the allowed roots is refused" ($rout.isError -eq $true -and $rout.content[0].text -match 'outside the allowed roots')
+        $runk = Call-Tool 'sandbox_recipe' @{ name = 'nope' }
+        Expect "an unknown recipe is refused, naming the recipes" ($runk.isError -eq $true -and $runk.content[0].text -match "unknown recipe 'nope' \(available: .*probe")
     }
 
     # Disconnect with the session still running: the server must destroy it before exiting.

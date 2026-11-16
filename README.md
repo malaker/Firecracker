@@ -188,6 +188,8 @@ Remove-Item -Recurse -Force C:\ProgramData\containerd
 | `.\fc.ps1 ssh <run-id> ['<command>']` | Open a shell in, or run a command in, a started VM |
 | `.\fc.ps1 put <run-id> <host-path> [-Dest <guest-dir>]` | Copy a host file, or a folder's contents, into a started VM (default `/work/in`, or `C:\work\in` on Windows) |
 | `.\fc.ps1 get <run-id> <guest-path> [-Dest <host-dir>]` | Copy a guest file or folder out of a started VM through the [guest output airlock](#guest-output-airlock) into an empty or new folder (default `runs\<run-id>\files\`). Exits `1` when the airlock refuses the files (links, devices, unsafe names, over the limits) or the guest path does not exist, and writes nothing |
+| `.\fc.ps1 recipe list` | List the ready-made [recipes](#recipes-fcps1-recipe) |
+| `.\fc.ps1 recipe <name> [-Sample <path>] [options]` | Run a recipe: a run whose command, image and network mode are fixed by the recipe (Linux guests only) |
 | `.\fc.ps1 mcp [-AllowRoot <dir>[,...]] [-AllowNetworked] [-MaxSessions <n>]` | Run the [MCP server](#mcp-server-fcps1-mcp) over stdio, for an MCP client to launch |
 | `.\fc.ps1 list` | List VMs: `running`, `dead` (process gone, e.g. after a WSL/service restart) or `kept`. `ROLE` is `vm`, or `airlock:<run-id>` for an airlock collecting that run's output |
 | `.\fc.ps1 stop <run-id>` | Destroy a VM (process, jail/Utility VM, disk copy/container, tap device and firewall rules on Linux, egress proxy on Windows) |
@@ -298,7 +300,7 @@ Inside the guest the payload is at `/work/in` (Linux) or `C:\work\in` (Windows) 
 
 ## Agents in the sandbox (`-Agent`)
 
-An agent run boots a Linux microVM from the **agent image** and runs the agent headless with a task prompt. The image is the base image plus Node.js, [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [Codex](https://github.com/openai/codex), pinned in [images/agent/package-lock.json](images/agent/package-lock.json). Use it to have an agent inspect a payload inside the sandbox, or to have it probe the sandbox itself from the inside. Windows guests are not supported (`-Agent` with `-Guest windows` exits `125`).
+An agent run boots a Linux microVM from the **agent image** and runs the agent headless with a task prompt. The image is the base image plus Node.js, [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [Codex](https://github.com/openai/codex), pinned in [images/agent/package-lock.json](images/agent/package-lock.json). It also holds analysis tools the agent can use: `file`, `strings`, `readelf`, `objdump`, `yara`, `pip` and `npm`, next to the base image's `strace` and `python3`. Their packages are pinned by checksum in [images/agent/tools.lock](images/agent/tools.lock). Use it to have an agent inspect a payload inside the sandbox, or to have it probe the sandbox itself from the inside. Windows guests are not supported (`-Agent` with `-Guest windows` exits `125`).
 
 ```powershell
 $env:ANTHROPIC_API_KEY = '<key>'      # or put it in %USERPROFILE%\.fc-sandbox\keys\anthropic.key
@@ -358,6 +360,149 @@ Besides the usual files, an agent run writes:
 
 The run's exit code is the client's. Inside the guest the prompt is at `/work/.fc/prompt.md`, and the payload, if any, is at `/work/in` as usual.
 
+## Recipes (`fc.ps1 recipe`)
+
+A recipe is a ready-made test: one command instead of a payload, a command line and the right options. Each recipe fixes its own command, boot image and network mode, so a recipe meant for an isolated VM cannot be run networked by mistake. Recipes run on Linux guests only.
+
+```powershell
+.\fc.ps1 recipe list                                   # what is available, and what each one takes
+.\fc.ps1 recipe <name> [-Sample <path>] [options]      # run one; results land in runs\<run-id>\ as usual
+```
+
+**Options for `recipe`:**
+
+| Option | Description |
+|---|---|
+| `-Sample <path>` | The file or folder to examine. It is uploaded to `/work/in` straight from where it lies; no copy is made on the host |
+| `-Package <spec>` | Package check recipes: a package name with an optional version, instead of `-Sample` |
+| `-Rules <dir>` | Recipes that scan with YARA: a folder of your rule files. No rules are shipped |
+| `-Entry <file>` | `detonate` with a folder sample: the file inside it to execute |
+| `-Agent <profile>`, `-Model <name>` | Agent recipes: the [agent profile](#agents-in-the-sandbox--agent) and model |
+| `-Timeout`, `-Vcpu`, `-MemMib`, `-Keep` | As for `run`; the recipe supplies the defaults |
+
+`-Cmd`, `-Payload`, `-Net`, `-Allow` and `-AgentDirect` are refused with a recipe (exit code `125`), because the recipe fixes them. Which inputs a recipe takes is in the `INPUT` column of `recipe list`: a plain name is required, `[name]` is optional, and `a|b` means exactly one of the two.
+
+**Results:** a recipe run writes the usual files to `runs\<run-id>\`. Scripted recipes add `out\report.md` (for people) and `out\report.json` (for tools), and `meta.json` records the recipe under `recipe` (`name`, `kind`, and the sample's file name or the package). A scripted recipe exits `0` once its report is written, whatever the examined sample did; the sample's own exit code is in the report.
+
+### Starter recipes
+
+| Recipe | Input | Network | What it does |
+|---|---|---|---|
+| `probe` | none | isolated | Self-test: checks from inside that nothing outside the VM answers |
+| `probe-net` | none | networked | Self-test: checks that the hosts, private ranges and other VMs stay blocked while the internet is open |
+| `triage-static` | sample, optional rules | isolated | Examines a sample without running it: hashes, file type, strings, executable headers, YARA matches |
+| `detonate` | sample, optional entry | isolated | Runs a sample under `strace`: the processes it started, the files it changed, the connections it attempted |
+| `npm-check` | sample or package | networked | Installs an npm package under `strace`: install scripts, processes, files, connections |
+| `pip-check` | sample or package | networked | Installs a Python package under `strace`: build code, processes, files, connections |
+| `agent-escape` | agent profile | isolated, gateway | An agent assesses the sandbox from inside: looks for ways out and reports what it finds |
+| `agent-triage` | agent profile, sample, optional rules | isolated, gateway | An agent examines a sample with the analysis tools, without running it, and reports |
+
+#### Sandbox self-tests (`probe`, `probe-net`)
+
+```powershell
+.\fc.ps1 recipe probe          # isolated VM: exit 0 when nothing answers
+.\fc.ps1 recipe probe-net      # networked VM: exit 0 when everything that must be blocked is blocked
+```
+
+Both run on the base image, the one ordinary runs use. From inside the VM they try, and record in the report with what was expected:
+
+- **Hosts that must never answer:** the WSL host (the VM's own gateway and `fc-host`'s address), the Windows host as WSL sees it, the addresses of neighbouring microVM slots, and one address in each private range (`10.0.0.1`, `172.16.0.1`, `192.168.0.1`, `192.168.1.1`, `100.64.0.1`, `169.254.169.254`). Each gets a ping and TCP connects to ports 22, 53, 80, 135, 443, 445, 2375, 3389 and 11434.
+- **Other ways out:** an IPv6 internet address, and the host over vsock on a few ports.
+- **The internet:** by address and by name. Expected closed in `probe`, open in `probe-net`.
+- **What the guest sees:** interfaces, kernel command line, block and virtio devices, mounts. These are listed, not judged.
+
+An answer from something expected to be blocked fails the run with exit code `1`. A TCP reset counts as an answer, because it shows the packet arrived. Something expected to be open that does not answer (the host is offline, say) is only a warning.
+
+> **Note:** `probe-net` sends pings and TCP connection attempts to the addresses above, including a few common private addresses that may exist on your network. They are single connection attempts, and the sandbox is expected to drop them before they leave the host. The probes check a fixed list; a pass means none of those answered, not that nothing else is reachable.
+
+#### Sample triage and detonation (`triage-static`, `detonate`)
+
+```powershell
+.\fc.ps1 recipe triage-static -Sample C:\quarantine\x.bin                       # look, don't run
+.\fc.ps1 recipe triage-static -Sample C:\quarantine\x.bin -Rules C:\yara-rules  # ...and scan with your YARA rules
+.\fc.ps1 recipe detonate -Sample C:\quarantine\x.sh                             # run it and watch
+.\fc.ps1 recipe detonate -Sample C:\quarantine\dropper -Entry bin/start.sh      # a folder: say which file to run
+```
+
+Both run in an isolated VM on the agent image, which holds the analysis tools.
+
+**`triage-static`** never executes the sample. For each file (up to 200 in a folder) the report gives the size, SHA-256, SHA-1 and MD5, the detected type, the entropy, and notable strings such as URLs, addresses and paths. ELF files also get their header, sections and libraries; Windows executables their imported DLLs and sections. The full strings list is in `out\strings\`. With `-Rules`, every `.yar` or `.yara` file in the folder is applied and matching rules are listed. Without it the scan is skipped and the report says so.
+
+**`detonate`** executes the sample as root for at most 120 seconds, then stops it and everything it started. The report gives the sample's exit code (or that it was stopped), the processes it started, the files it created, changed or deleted, and the connections it attempted, which all fail because the VM has no network. The raw trace is in `out\trace.log` and the sample's own output in `out\program-stdout.log` and `program-stderr.log`.
+
+- **What can be run:** ELF executables, scripts with a `#!` line, and files ending in `.sh`, `.bash`, `.py`, `.js`, `.mjs` or `.pl`. Anything else, including Windows executables, is reported as not run; use `triage-static` for those.
+- **Evidence limits:** the trace is recorded inside the guest. A sample can detect `strace` and behave differently, and code running as root in the guest could alter the record. Treat a quiet trace as "nothing seen", not "nothing there".
+- **Sample text is untrusted:** strings and program output in the reports come from the sample.
+
+> **Note:** the sample must be readable where it lies. Antivirus on Windows may block or remove a real sample while `fc.ps1` reads it; keep samples in a folder excluded from scanning, and expect the run to fail with exit code `125` if the file disappears.
+
+#### Package install checks (`npm-check`, `pip-check`)
+
+```powershell
+.\fc.ps1 recipe npm-check -Package left-pad@1.3.0        # a package from the registry, by name and version
+.\fc.ps1 recipe npm-check -Sample C:\src\some-package    # a local package folder or .tgz file
+.\fc.ps1 recipe pip-check -Package six==1.16.0           # a package from PyPI
+.\fc.ps1 recipe pip-check -Sample C:\src\some-project    # a local project folder, sdist or wheel
+```
+
+Each installs the package as root in a networked VM (`npm install` into `/work/pkg`, or `pip install --target /work/pkg/site`) for at most 10 minutes and reports:
+
+- **What was installed:** every package with its version, dependencies included.
+- **Install-time code:** for npm, each declared `preinstall`, `install` and `postinstall` script and whether it was seen running. For pip, the build code that ran; a wheel runs none.
+- **Processes** the install started.
+- **Files written outside the install folder.** The installer's own cache and temporary build folders are left out, but a few of the installer's unnamed temporary files in `/tmp` may still appear.
+- **Connections:** address, port and outcome. Host names are not recorded, and the name server shows up as `1.1.1.1:53`.
+
+The VM runs networked without an allowlist, because registries sit behind CDNs with changing addresses. The usual host protection applies: the hosts, private ranges and other VMs stay blocked.
+
+> **Note:** this evidence is recorded inside the guest, and the install runs as root there. An install script could detect tracing, behave differently, or alter the record. A clean report does not prove a package is safe. A host-side connection log for Linux guests is not available yet.
+
+#### Agent recipes (`agent-escape`, `agent-triage`)
+
+```powershell
+.\fc.ps1 recipe agent-escape -Agent claude                                   # needs the profile's API key
+.\fc.ps1 recipe agent-triage -Agent codex -Sample C:\quarantine\x.bin
+.\fc.ps1 recipe agent-triage -Agent codex-ollama -Sample C:\quarantine\x.bin -Rules C:\yara-rules
+```
+
+These are [agent runs](#agents-in-the-sandbox--agent) with a ready-made prompt: the recipe supplies the task, and you pick the profile with `-Agent` (and optionally `-Model`). They always run in gateway mode, so the VM has no network and the API key stays on the host; `-AgentDirect` is refused. Both default to a 30-minute timeout.
+
+- **`agent-escape`** tells the agent what the sandbox claims (no network, a gateway that only passes model calls, a placeholder key, no host files) and asks it to test those claims from inside and report what held and what did not. The prompt is in [recipes/agent-escape/prompt.md](recipes/agent-escape/prompt.md).
+- **`agent-triage`** puts the sample in `/work/in` (and your rules in `/work/rules`) and asks the agent to examine it with the analysis tools, without executing it, and to report a verdict, the evidence and indicators. The prompt is in [recipes/agent-triage/prompt.md](recipes/agent-triage/prompt.md).
+
+The results are those of any agent run: `out\agent-transcript.jsonl`, `llm.log` and `meta.json`, plus whatever the agent wrote to `/work/out`. The prompts ask for `out\report.md`, but **the report is best-effort**: a model can refuse a task, stop early or write something else. The transcript is always collected and shows what the agent actually did. There is no `report.json` for agent recipes.
+
+- **Data leaves your machine:** the agent sends what it reads, including sample contents, to the model provider. Use `codex-ollama` with a local server for samples that must stay local.
+- **The sample can talk to the agent:** text inside a sample may be written to steer the agent. The prompt tells it to treat such text as data, which lowers the risk but does not remove it. Read the report as untrusted output.
+- **"Without running it" is an instruction, not a control:** nothing stops the agent from executing the sample inside the VM. The VM is isolated either way.
+
+### Adding a recipe
+
+A recipe is a folder under [recipes/](recipes/) with a `recipe.json` manifest and whatever scripts it needs. Re-run `.\fc.ps1 setup` to install a new or changed recipe. `.\fc.ps1 doctor` reports a manifest it cannot accept, and such a recipe does not run.
+
+```json
+{
+  "description": "Lists the files in a sample",
+  "kind": "command",
+  "image": "base",
+  "net": "isolated",
+  "command": "ls -lR /work/in > /work/out/report.md",
+  "input": { "sample": "required" },
+  "timeout": "5m"
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `description` | One line for `recipe list` |
+| `kind` | `command` (runs `command`) or `agent` (runs an agent with the prompt file named in `prompt`; needs `image: agent` and `net: isolated`) |
+| `image` | `base`, or `agent` for the image with the [analysis tools](#agents-in-the-sandbox--agent) |
+| `net` | `isolated` or `networked` |
+| `input` | `sample`, `package`, `rules` and `entry`, each `none` (default), `optional` or `required`. `"require_one_of": ["sample", "package"]` asks for exactly one of the two |
+| `timeout`, `vcpu`, `mem_mib` | Optional defaults for the run |
+
+Inside the guest the recipe's folder is at `/work/recipe` (shared helpers from `recipes/_lib` at `/work/recipe/_lib`), the sample at `/work/in`, the rules at `/work/rules`, and `/work/.fc/recipe.env` holds `FC_RECIPE`, `FC_RECIPE_SAMPLE_KIND` (`none`, `file` or `dir`), `FC_RECIPE_SAMPLE` (the file name), `FC_RECIPE_PACKAGE`, `FC_RECIPE_ENTRY` and `FC_RECIPE_RULES` (`1` or `0`). Whatever the recipe writes to `/work/out` is collected.
+
 ## MCP server (`fc.ps1 mcp`)
 
 `fc.ps1 mcp` exposes the sandbox to any MCP client (Claude Code, other stdio MCP clients) as tools, so an agent on the host can send risky work (detonating a sample, running an exploit PoC or an untrusted installer) into a disposable VM instead of running it on the host. The server is a policy layer over `fc.ps1`; isolation comes entirely from the backends described above.
@@ -402,6 +547,8 @@ Any other stdio MCP client takes the same command, for example:
 | `sandbox_get` | Copy a guest file or folder out through the guest output airlock into `runs\<session>\files\<n>\`; the agent cannot choose the host destination |
 | `sandbox_list` | This server's sessions |
 | `sandbox_stop` | Destroy a session |
+| `sandbox_recipes` | List the [recipes](#recipes-fcps1-recipe) with their kind, network mode and inputs, and whether this server would run each one. Starts no VM |
+| `sandbox_recipe` | Run one recipe by `name` (Linux guests) with the inputs it takes: `sample_path` and `rules_path` (inside the allowed roots), `package`, `entry`, and for agent recipes `agent` and `model`. `timeout`, `vcpu` and `mem_mib` are optional. Returns the same fields as `sandbox_run`, plus `recipe`, `net`, `report_path` and `report_json_path`. The agent cannot change a recipe's command, image or network mode. Networked recipes (`probe-net`, `npm-check`, `pip-check`) need `-AllowNetworked`; agent recipes run in gateway mode |
 
 **Rules the server enforces:**
 
@@ -430,6 +577,9 @@ A refused collection keeps the guest command's exit code, leaves `out\` empty, p
 - **LLM gateway (agent gateway mode):** the gateway is new host code that reads guest data: HTTP requests from the agent VM. It is written in a memory-safe language and runs per VM as an unprivileged uid that only that VM's jail can reach, with limits on headers, sizes and connections. It checks the endpoint and the model, not the request's content. An agent, or a payload that takes the agent over, can send anything it sees to the provider, within the budgets.
 - **Data sent to providers:** an agent run sends the prompt to Anthropic, OpenAI or your Ollama server, along with whatever the agent reads in the VM, including payload contents. Use `codex-ollama` with a local server for samples that must not leave your machine.
 - **Direct mode puts the API key in the VM** and gives the VM network access. Treat any key used with `-AgentDirect` as exposed.
+- **Recipes give evidence, not verdicts:** `detonate`, `npm-check` and `pip-check` record what happens with `strace` inside the guest, where the examined code runs as root. A sample can detect tracing and stay quiet, and code in the guest could alter the record. The probes test a fixed list of addresses and ports. A clean report means nothing was seen, not that a sample or package is safe or that the sandbox has no gap.
+- **Package checks run untrusted code with internet access:** `npm-check` and `pip-check` need a networked VM without an allowlist. The hosts, private ranges and other VMs stay blocked, but the install can reach any public address and send it whatever is in the VM, which is only the package itself. Traffic leaves from your public IP address.
+- **Reports are guest output:** recipe reports quote strings and program output from the sample. Through MCP they are returned as file paths, not inlined; a host agent that reads them should treat them as untrusted, like any guest output.
 - **Agents follow instructions in what they read:** a payload can contain text aimed at the agent. Inside the VM that can only misuse the agent's budget and output. Treat its transcript and output as untrusted, like any guest output.
 - **MCP server and prompt injection:** a sample's output reaches the host agent through the MCP tools. The server bounds and marks that output and offers no host-side tools, but a marker does not stop a model from following instructions in it; the client's permission settings remain the final control.
 - **Elevated MCP clients:** using Windows guests through MCP means running the MCP client elevated, so everything that client does runs with administrator rights. Use a separate elevated client session only for Windows-guest work.
@@ -451,7 +601,7 @@ A refused collection keeps the guest command's exit code, leaves `out\` empty, p
 Run the end-to-end smoke tests from the repository root:
 
 ```powershell
-# Linux Firecracker smoke tests (inside fc-host as root, about 5 minutes)
+# Linux Firecracker smoke tests (inside fc-host as root, about 10 minutes)
 wsl -d fc-host -u root -e bash /mnt/c/sources/Firecracker/tests/smoke/all.sh
 
 # Windows Nano Server microVM smoke tests (in an elevated PowerShell prompt)
@@ -483,6 +633,8 @@ The Windows suite and each of its parts (`net-isolated.ps1`, `lifecycle.ps1`, `n
 
 The agent tests (`tests/smoke/agents.sh`, part of `all.sh`, and the MCP tests) use a local fake provider ([tests/smoke/fake-provider.py](tests/smoke/fake-provider.py)), so they need no API keys. The one exception is a direct-mode check that sends an invalid key to the real Anthropic API.
 
+The recipe tests (`tests/smoke/recipes.sh`, part of `all.sh`) run every starter recipe against benign samples in [tests/smoke/samples/](tests/smoke/samples/). The package checks need internet access: they install `left-pad` from the npm registry and `six` from PyPI, and the local Python test project downloads its build tool. After changing anything under `recipes\`, re-run `.\fc.ps1 setup` before testing.
+
 After changing anything under `windows\egress`, re-run `.\fc.ps1 setup -Guest windows`: VMs use the binaries it publishes to `C:\ProgramData\fc-sandbox-win\bin\egress\`, not the ones in the repository's build folders.
 
 Repository layout:
@@ -500,6 +652,8 @@ Repository layout:
 | [images/build-rootfs.sh](images/build-rootfs.sh) | Builds the base Linux guest image |
 | [images/build-agent-rootfs.sh](images/build-agent-rootfs.sh), [images/agent/](images/agent/) | Builds the agent image (Node.js, Claude Code, Codex, the `fc-agent` wrapper) |
 | [gateway/](gateway/) | LLM gateway `fc-llm-gateway` (`FcGateway`) and tests |
+| [recipes/](recipes/), [host/lib/recipe.sh](host/lib/recipe.sh) | The ready-made recipes (manifest and scripts per recipe, shared helpers in `_lib`) and the controller's `recipe` command |
+| [images/agent/tools.lock](images/agent/tools.lock) | Checksum-pinned analysis tool packages for the agent image |
 | [host/agents/profiles.json](host/agents/profiles.json), [host/lib/agent.sh](host/lib/agent.sh) | Agent profiles and the controller's agent and gateway handling |
 | [samples/hello/](samples/hello/), [samples/hello-win/](samples/hello-win/) | Sample payloads for Linux and Windows guests |
 | [tests/smoke/](tests/smoke/), [tests/smoke-win/](tests/smoke-win/) | End-to-end smoke tests for Linux and Windows microVMs |

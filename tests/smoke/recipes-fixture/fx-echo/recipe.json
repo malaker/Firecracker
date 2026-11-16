@@ -1,0 +1,9 @@
+{
+  "description": "Fixture: shows what reached the guest",
+  "kind": "command",
+  "image": "base",
+  "net": "isolated",
+  "command": "sh /work/recipe/run.sh",
+  "input": { "sample": "optional", "rules": "optional" },
+  "timeout": "3m", "vcpu": 1, "mem_mib": 256
+}

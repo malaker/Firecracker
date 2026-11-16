@@ -50,6 +50,7 @@ probe="$(printf '%s\n' \
   'echo "model=$(curl -s -o /dev/null -w %{http_code} -X POST http://127.0.0.1:8080/v1/messages -H content-type:application/json -d "{\"model\":\"gpt-5\"}")"' \
   'head -c 17000000 /dev/zero | tr "\0" a > /tmp/big; echo "size=$(curl -s -o /dev/null -w %{http_code} -X POST http://127.0.0.1:8080/v1/messages -H content-type:application/json --data-binary @/tmp/big)"' \
   'echo "internet=$(curl -s -m 5 -o /dev/null -w %{http_code} https://example.com || true)"' \
+  'echo "tools=$(for t in file strings readelf objdump yara pip npm; do $t --version >/dev/null 2>&1 || printf "%s," $t; done)ok"' \
   'echo "keyinguest=$(grep -rlsF -- "'"$SECRET"'" /root /work /etc /tmp 2>/dev/null | wc -l) envkey=$(env | grep -cF -- "'"$SECRET"'")"' \
   'for i in 1 2 3; do curl -s -o /dev/null -X POST http://127.0.0.1:8080/v1/messages -H content-type:application/json -d "{\"model\":\"claude-x\"}"; done; echo "budget=$(curl -s -o /dev/null -w %{http_code} -X POST http://127.0.0.1:8080/v1/messages -H content-type:application/json -d "{\"model\":\"claude-x\"}")"' \
   'exit' \
@@ -62,6 +63,7 @@ expect "oversized request is refused (413)" test "$(val size)" = 413
 expect "no internet from a gateway-mode VM" test "$(val internet)" = 000
 expect "no real key in the guest's files or environment" test "$(val keyinguest)/$(val envkey)" = "0/0"
 expect "token budget is enforced (429)" test "$(val budget)" = 429
+expect "analysis tools run in the agent image (file, binutils, yara, pip, npm)" test "$(val tools)" = ok
 expect "the gateway is gone after the shell" test "$(gw_procs)" = 0
 
 # 3. Cleanup after a killed controller.

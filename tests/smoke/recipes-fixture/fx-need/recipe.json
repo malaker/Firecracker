@@ -1,0 +1,2 @@
+{ "description": "Fixture: needs a sample", "kind": "command", "image": "base", "net": "isolated",
+  "command": "ls /work/in > /work/out/report.md", "input": { "sample": "required" } }
