@@ -34,3 +34,10 @@ windows/common/**/obj/
 # .NET build output (gateway)
 gateway/**/bin/
 gateway/**/obj/
+
+# .NET build output (audit)
+audit/**/bin/
+audit/**/obj/
+# .NET build output (audit probe sample)
+samples/audit-win/bin/
+samples/audit-win/obj/

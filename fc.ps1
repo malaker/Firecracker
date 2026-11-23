@@ -13,6 +13,7 @@
   .\fc.ps1 shell -Net networked
   .\fc.ps1 recipe list
   .\fc.ps1 recipe triage-static -Sample C:\quarantine\x.bin
+  .\fc.ps1 audit -Guest windows -Sample C:\quarantine\tool -Entry tool.exe -Arguments '--version'
   .\fc.ps1 list
   .\fc.ps1 stop <run-id>
   .\fc.ps1 cleanup
@@ -20,7 +21,7 @@
 [CmdletBinding(PositionalBinding = $false)]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('setup', 'doctor', 'run', 'shell', 'start', 'ssh', 'put', 'get', 'list', 'stop', 'cleanup', 'mcp', 'recipe', 'help')]
+    [ValidateSet('setup', 'doctor', 'run', 'shell', 'start', 'ssh', 'put', 'get', 'list', 'stop', 'cleanup', 'mcp', 'recipe', 'audit', 'help')]
     [string]$Command = 'help',
 
     # run-id for stop/ssh/put/get, followed by a command (ssh), a host path (put) or a guest path (get).
@@ -81,7 +82,13 @@ param(
     [string]$Package,
     [string]$Rules,
     [string]$Entry,
-    [switch]$Json
+    [switch]$Json,
+
+    # audit (Windows guests): the program's command line, top-level names of a folder -Sample to
+    # leave out of the copy, and where to stage that copy (default: the temp folder).
+    [AllowEmptyString()][string]$Arguments,
+    [string[]]$Exclude,
+    [string]$StagingDir
 )
 
 $ErrorActionPreference = 'Stop'
@@ -145,6 +152,27 @@ if ($Agent -and $Guest -eq 'windows') {
     exit 125
 }
 
+# Audits (spec: sandbox-audit) run Windows programs in Windows guests only.
+if ($Command -eq 'audit') {
+    if ($Guest -ne 'windows') {
+        [Console]::Error.WriteLine("[fc] ERROR: audit needs -Guest windows (it audits Windows programs). For Linux samples use 'fc.ps1 recipe detonate' or 'fc.ps1 recipe triage-static'.")
+        exit 125
+    }
+    foreach ($runFlag in @('Cmd', 'Payload')) {
+        if ($PSBoundParameters.ContainsKey($runFlag)) {
+            [Console]::Error.WriteLine("[fc] ERROR: -$runFlag cannot be used with audit: give the program with -Sample (and -Entry for a folder) and its arguments with -Arguments.")
+            exit 125
+        }
+    }
+    if (-not $Sample) {
+        [Console]::Error.WriteLine("[fc] ERROR: audit needs -Sample <program file or folder>.")
+        exit 125
+    }
+} elseif ($Arguments -or $Exclude -or $StagingDir) {
+    [Console]::Error.WriteLine("[fc] ERROR: -Arguments, -Exclude and -StagingDir only apply to audit.")
+    exit 125
+}
+
 if ($Command -eq 'recipe' -and $Guest -eq 'windows') {
     [Console]::Error.WriteLine("[fc] ERROR: recipes need Linux guests (-Guest linux); Windows guests are not supported.")
     exit 125
@@ -195,6 +223,20 @@ if ($Guest -eq 'windows') {
     if ($Timeout) { $winParams.Timeout = $Timeout }
     if ($Keep)    { $winParams.Keep    = $true }
     if ($Boot)    { $winParams.Boot    = $true }
+    if ($Command -eq 'audit') {
+        # Host paths are resolved here, against the caller's folder.
+        $winParams.Sample = if ([System.IO.Path]::IsPathRooted($Sample)) { $Sample } else { Join-Path (Get-Location).ProviderPath $Sample }
+        if ($Entry)      { $winParams.Entry = $Entry }
+        if ($PSBoundParameters.ContainsKey('Arguments')) { $winParams.Arguments = $Arguments }
+        if ($Exclude)    { $winParams.Exclude = $Exclude }
+        if ($StagingDir) { $winParams.StagingDir = if ([System.IO.Path]::IsPathRooted($StagingDir)) { $StagingDir } else { Join-Path (Get-Location).ProviderPath $StagingDir } }
+        # Audit defaults: -Timeout limits the program alone, and the snapshots need some room.
+        if (-not $Timeout) { $winParams.Timeout = '5m' }
+        if (-not $MemMib)  { $winParams.MemMib = 2048 }
+        $runs = Join-Path $PSScriptRoot 'runs'
+        New-Item -ItemType Directory -Force -Path $runs | Out-Null
+        $winParams.ResultsDir = $runs
+    }
     if ($Command -eq 'run') {
         $runs = Join-Path $PSScriptRoot 'runs'
         New-Item -ItemType Directory -Force -Path $runs | Out-Null

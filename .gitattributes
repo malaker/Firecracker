@@ -13,3 +13,5 @@ images/agent/tools.lock text eol=lf
 recipes/** text eol=lf
 tests/smoke/samples/** text eol=lf
 tests/smoke/recipes-fixture/** text eol=lf
+# Golden report files are compared byte-for-byte by the fc-audit tests.
+audit/FcAudit.Tests/Fixtures/** -text

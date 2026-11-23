@@ -53,7 +53,7 @@ flowchart LR
 - Windows 11 with a CPU that has hardware virtualization (Intel VT-x or AMD-V) enabled in firmware
 - **For `-Guest linux` (default):** WSL 2 (a recent version that supports `wsl --install <distro> --name`) and WSL2 nested virtualization (on by default on Windows 11; setup offers to enable it if needed)
 - **For `-Guest windows`:** An elevated (Administrator) PowerShell prompt, plus the Windows `Microsoft-Hyper-V` and `Containers` optional features (setup offers to enable them if needed)
-- **The [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)** (**breaking change:** earlier versions needed it only for Windows networked mode), used by setup to build the guest output airlock tool (`fc-airlock`) and the MCP server (`fc-mcp.exe`). Linux and Windows setup both fail without it, because run output is collected through the airlock. For `-Guest windows -Net networked` it also builds the egress proxy (`fc-egress.exe`) and the guest relay (`fc-relay.exe`).
+- **The [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)** (**breaking change:** earlier versions needed it only for Windows networked mode), used by setup to build the guest output airlock tool (`fc-airlock`) and the MCP server (`fc-mcp.exe`), and on Windows the audit report tool (`fc-audit.exe`). Linux and Windows setup both fail without it, because run output is collected through the airlock. For `-Guest windows -Net networked` it also builds the egress proxy (`fc-egress.exe`) and the guest relay (`fc-relay.exe`).
 - About 6 GB of free disk space and internet access during setup
 
 Tested with Windows 11 build 26200, WSL 2.6.3 (kernel 6.6.87), Firecracker v1.17.0, and Nano Server 2025 (`ltsc2025`).
@@ -127,7 +127,8 @@ cmd /c mklink /J .\externalimages C:\sources\nanoserver
 3. Saves the selected runtime, image repository, and default flavour in `C:\ProgramData\fc-sandbox-win\config.json`.
 4. Pulls `<ImageRepo>:<Flavour>` (or builds `<Flavour>` locally from `./externalimages` when `-BuildFromSource` is passed).
 5. Builds the networked-mode egress binaries from [windows/egress](windows/egress) with the .NET 10 SDK into `C:\ProgramData\fc-sandbox-win\bin\egress\` (`host\fc-egress.exe`, `guest\fc-relay.exe`). It skips the build when they are newer than the sources, and warns without failing when no .NET 10 SDK is installed.
-6. Runs `.\fc.ps1 doctor -Guest windows`, which reports whether the egress binaries are present.
+6. Builds the guest output airlock tool (`bin\airlock\fc-airlock.exe`) and the [audit](#auditing-a-windows-program-fcps1-audit) report tool (`bin\audit\fc-audit.exe`) under `C:\ProgramData\fc-sandbox-win\` with the .NET 10 SDK, in folders only administrators can modify. Each is rebuilt only when its sources are newer, and setup fails naming the SDK when none is installed.
+7. Runs `.\fc.ps1 doctor -Guest windows`, which reports whether the egress binaries, `fc-airlock.exe` and `fc-audit.exe` are present.
 
 ### Checking the host
 
@@ -150,7 +151,7 @@ Remove-Item -Recurse .\runs
 .\fc.ps1 cleanup -Guest windows
 Stop-Service docker, containerd -ErrorAction SilentlyContinue
 & C:\ProgramData\fc-sandbox-win\bin\dockerd.exe --unregister-service   # only if setup registered the docker service
-Remove-Item -Recurse -Force C:\ProgramData\fc-sandbox-win -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force C:\ProgramData\fc-sandbox-win -ErrorAction SilentlyContinue   # includes bin\airlock and bin\audit
 # setup also writes DNS servers into C:\ProgramData\docker\config\daemon.json; remove that file if nothing else uses Docker
 ```
 
@@ -193,6 +194,7 @@ Remove-Item -Recurse -Force C:\ProgramData\containerd
 | `.\fc.ps1 get <run-id> <guest-path> [-Dest <host-dir>]` | Copy a guest file or folder out of a started VM through the [guest output airlock](#guest-output-airlock) into an empty or new folder (default `runs\<run-id>\files\`). Exits `1` when the airlock refuses the files (links, devices, unsafe names, over the limits) or the guest path does not exist, and writes nothing |
 | `.\fc.ps1 recipe list` | List the ready-made [recipes](#recipes-fcps1-recipe) |
 | `.\fc.ps1 recipe <name> [-Sample <path>] [options]` | Run a recipe: a run whose command, image and network mode are fixed by the recipe (Linux guests only) |
+| `.\fc.ps1 audit -Guest windows -Sample <path> [-Entry <file>] [-Arguments '<args>'] [options]` | [Audit a Windows program](#auditing-a-windows-program-fcps1-audit): run it in disposable VMs (isolated, then networked) and report the hosts it contacted, the files and registry values it changed and what it wrote |
 | `.\fc.ps1 mcp [-AllowRoot <dir>[,...]] [-AllowNetworked] [-MaxSessions <n>]` | Run the [MCP server](#mcp-server-fcps1-mcp) over stdio, for an MCP client to launch |
 | `.\fc.ps1 list` | List VMs: `running`, `dead` (process gone, e.g. after a WSL/service restart) or `kept`. `ROLE` is `vm`, or `airlock:<run-id>` for an airlock collecting that run's output |
 | `.\fc.ps1 stop <run-id>` | Destroy a VM (process, jail/Utility VM, disk copy/container, tap device and firewall rules on Linux, egress proxy on Windows) |
@@ -510,6 +512,75 @@ Any other field makes the manifest invalid.
 
 Inside the guest the recipe's folder is at `/work/recipe` (shared helpers from `recipes/_lib` at `/work/recipe/_lib`), the sample at `/work/in`, the rules at `/work/rules`, and `/work/.fc/recipe.env` holds `FC_RECIPE`, `FC_RECIPE_SAMPLE_KIND` (`none`, `file` or `dir`), `FC_RECIPE_SAMPLE` (the file name), `FC_RECIPE_PACKAGE`, `FC_RECIPE_ENTRY` and `FC_RECIPE_RULES` (`1` or `0`). With `host_facts` it also holds `FC_HOST_WSL` (`fc-host`'s address), `FC_HOST_WINDOWS` (the Windows host as WSL sees it) and `FC_VM_RANGE` (the microVM address range). Whatever the recipe writes to `/work/out` is collected.
 
+## Auditing a Windows program (`fc.ps1 audit`)
+
+`fc.ps1 audit` answers "what does this program connect to, and what does it change?" for a Windows program, in one command. It runs the program in a fresh Windows Nano Server microVM, records the guest's files and registry before and after, and writes a report. Run it from an elevated PowerShell prompt, like every `-Guest windows` command.
+
+```powershell
+# A single executable
+.\fc.ps1 audit -Guest windows -Sample C:\quarantine\tool.exe -Arguments '--version'
+
+# A program folder: -Entry names the exe inside it; -Exclude leaves your own data out of the copy
+.\fc.ps1 audit -Guest windows -Sample C:\Tools\yt-dlp -Entry yt-dlp.exe -Exclude audio `
+    -Arguments '-v -f worst -o video.%(ext)s https://www.youtube.com/watch?v=BaW_jenozKc'
+
+# Only the networked run, restricted to some destinations
+.\fc.ps1 audit -Guest windows -Sample C:\quarantine\tool.exe -Net networked -Allow 203.0.113.0/24
+```
+
+**What happens.** Without `-Net`, two runs, each in its own VM that is destroyed afterwards:
+
+1. **isolated:** no network device. Shows how the program behaves offline and what it changes locally.
+2. **networked:** still no network adapter. Every TCP connection goes through the [egress proxy](#network-modes), which blocks the host, the LAN and private ranges, and logs each attempt in `net.log`.
+
+In each VM the program runs as `ContainerAdministrator` with `C:\work\out` as its working directory, so files it writes there are collected. Before and after it runs, the guest lists every file and folder on `C:\` and exports `HKLM\SOFTWARE` and `HKCU`. A program still running at `-Timeout` is stopped by its image name, together with the processes it started, and then the after snapshots are taken and its output is collected. Nano Server has no `taskkill.exe`, so for this step the controller uploads `fc-audit.exe` into the guest and runs `fc-audit kill --image <name>`; a guest image that has `taskkill.exe` uses that instead. The report says whether it was stopped. A batch-file entry (`.cmd`, `.bat`) runs as `cmd.exe` and cannot be stopped by name, so its after snapshots are taken while it may still be running.
+
+**Options.**
+
+| Option | Default | Description |
+|---|---|---|
+| `-Sample <path>` | required | The program: an executable, or a folder that contains it |
+| `-Entry <file>` | the file itself | For a folder: the program's path inside it, e.g. `bin\tool.exe` |
+| `-Arguments '<args>'` | none | The program's command line, passed exactly as written. `%`, `&`, `\|`, quotes and brackets are not interpreted by the guest's `cmd.exe`. Control characters (line breaks, tabs) are refused |
+| `-Exclude <name>[,...]` | none | Names of entries directly inside a folder sample to leave out of the copy, e.g. your own data. Paths such as `config\secrets.json` are refused: exclude the whole top-level folder instead |
+| `-StagingDir <dir>` | the temp folder | Where the sample is copied before upload. The copy is deleted when the audit ends |
+| `-Net isolated\|networked` | both | Do only one of the two runs |
+| `-Allow <cidr>[,...]` | none | Networked run only: allow egress only to these destinations, as for `run` |
+| `-Timeout <dur>` | `5m` | Time limit for the program alone (the snapshots have their own limits) |
+| `-MemMib <n>` | `2048` | Guest memory |
+| `-Vcpu`, `-Flavour`, `-WinRuntime`, `-Keep` | as for `run` | |
+
+**Results.** Each run is an ordinary run folder, `runs\<run-id>\` (with `stdout.log`, `stderr.log`, `net.log`, `out\` and `meta.json`, which records the audit under `audit`), plus:
+
+| File | Content |
+|---|---|
+| `audit-report.md` | The report for people: the program and its SHA-256, the arguments, the exit code or that it did not finish, the other run of the pair, then the sections below |
+| `audit-report.json` | The same facts for tools (`schema: fc-audit-report/1`) |
+| `audit\files-created.txt`, `audit\files-deleted.txt`, `audit\registry-changes.txt` | Full lists (the Markdown report shows at most 200 lines per list) |
+| `out\_audit\` | The raw snapshots (`fs-before.txt`, `fs-after.txt`, `hklm-*.reg`, `hkcu-*.reg`) |
+
+The report sections:
+
+- **Network:** each distinct host, port and decision (`allowed`, `denied`, `failed`) from `net.log`, in order of first attempt, with the number of attempts, the resolved addresses, the reason, and the bytes sent and received. The isolated run states that the VM had no network device.
+- **Files created and deleted** anywhere on `C:\` outside `C:\work`.
+- **Registry changes** in `HKLM\SOFTWARE` and `HKCU`: keys and values added, removed or changed. Changes Windows itself makes while any program runs (such as `...\Windows NT\CurrentVersion\Notifications\Data`) are labelled as such.
+- **Files the program wrote** to its working directory.
+- **Limits of this evidence** (below).
+
+The audit exits `0` when every run finished and its report was written, whatever the program's own exit code (which is in the report and in the run's `exit_code`, `124` if it did not finish). It exits `125` when a VM failed to start, output could not be collected, or a report could not be built; a failed isolated run does not stop the networked run.
+
+**How the report is built.** The snapshots and `net.log` come from the guest, so the elevated controller does not parse them. It starts `fc-audit.exe` (built by setup) with a restricted, non-admin token in a job limited to 120 seconds and 1 GiB, the same way the [airlock](#guest-output-airlock) unpacks output. `fc-audit report` refuses to run with administrator rights at all. If the report cannot be built, the run keeps its results and no report is written. Guest text appears in the Markdown only inside code spans and blocks.
+
+**Limits of this evidence** (also stated in every report):
+
+- The program runs as an administrator inside the guest and could alter the snapshots. A clean report means nothing was seen, not that the program is safe.
+- Modified files are not detected, only created and deleted ones, and file contents are not hashed.
+- For encrypted traffic only host names and ports are visible, not URLs or content.
+- Programs that ignore `HTTP_PROXY`/`HTTPS_PROXY` get no network at all in the networked run and leave no `net.log` entry. Their failed attempts usually show up in `stderr.log`.
+- Only `HKLM\SOFTWARE` and `HKCU` are compared.
+
+> **Note:** the sample is copied into the staging folder before upload. Antivirus may block or remove a real sample there; point `-StagingDir` at a folder excluded from scanning, and expect exit code `125` if the copy fails. A sample folder that contains a junction or symbolic link (outside the `-Exclude`d entries) is refused, so a hostile folder cannot pull other host files into the VM. Other reparse points, such as OneDrive placeholders, are copied as ordinary files.
+
 ## MCP server (`fc.ps1 mcp`)
 
 `fc.ps1 mcp` exposes the sandbox to any MCP client (Claude Code, other stdio MCP clients) as tools, so an agent on the host can send risky work (detonating a sample, running an exploit PoC or an untrusted installer) into a disposable VM instead of running it on the host. The server is a policy layer over `fc.ps1`; isolation comes entirely from the backends described above.
@@ -581,6 +652,7 @@ A refused collection keeps the guest command's exit code, leaves `out\` empty, p
 
 ## Security considerations and limitations
 
+- **Audit report tool:** `fc-audit report` is the second host component that reads data derived from guest output (snapshots and `net.log`). It is written in a memory-safe language, caps each input at 64 MiB, refuses to run with administrator rights, and is started from the elevated controller only through `launch-report`, with a restricted token, a 120-second limit and 1 GiB of memory. The controller moves only the expected report files into place, without reading them.
 - **LLM gateway (agent gateway mode):** the gateway is new host code that reads guest data: HTTP requests from the agent VM. It is written in a memory-safe language and runs per VM as an unprivileged uid that only that VM's jail can reach, with limits on headers, sizes and connections. It checks the endpoint and the model, not the request's content. An agent, or a payload that takes the agent over, can send anything it sees to the provider, within the budgets.
 - **Data sent to providers:** an agent run sends the prompt to Anthropic, OpenAI or your Ollama server, along with whatever the agent reads in the VM, including payload contents. Use `codex-ollama` with a local server for samples that must not leave your machine.
 - **Direct mode puts the API key in the VM** and gives the VM network access. Treat any key used with `-AgentDirect` as exposed.
@@ -591,7 +663,7 @@ A refused collection keeps the guest command's exit code, leaves `out\` empty, p
 - **MCP server and prompt injection:** a sample's output reaches the host agent through the MCP tools. The server bounds and marks that output and offers no host-side tools, but a marker does not stop a model from following instructions in it; the client's permission settings remain the final control.
 - **Elevated MCP clients:** using Windows guests through MCP means running the MCP client elevated, so everything that client does runs with administrator rights. Use a separate elevated client session only for Windows-guest work.
 - **Killed MCP server:** if the server process is killed instead of stopped, its sessions keep running until their hard timeout (default 30 minutes; use a shorter `timeout` for agent sessions) or until `fc.ps1 cleanup`.
-- **Guest output airlock:** the only host code that reads data derived from guest output is `fc-airlock unpack`. It parses a small manifest (JSON) and copies byte ranges, in a memory-safe language, without admin or root rights, after the riskier archive parsing already ran inside a throwaway airlock VM. An attacker would need to compromise the airlock and then this reader. Each collection with output costs one more VM boot (about 1.5-8 s for Linux, about 3.5-5 s for Windows). The Windows link check before the copy relies on the guest's answer; a guest that hides a link only gets its own files collected, within the limits.
+- **Guest output airlock:** apart from `fc-audit report` (see the audit report tool above), the only host code that reads data derived from guest output is `fc-airlock unpack`. It parses a small manifest (JSON) and copies byte ranges, in a memory-safe language, without admin or root rights, after the riskier archive parsing already ran inside a throwaway airlock VM. An attacker would need to compromise the airlock and then this reader. Each collection with output costs one more VM boot (about 1.5-8 s for Linux, about 3.5-5 s for Windows). The Windows link check before the copy relies on the guest's answer; a guest that hides a link only gets its own files collected, within the limits.
 - **Linux (Firecracker + jailer):** Firecracker with the jailer provides strong isolation but is not a guarantee against KVM or Firecracker escape vulnerabilities. A successful escape would land in the `fc-host` WSL VM, which can access Windows drives through `/mnt/c`. For high-risk samples, set `[automount] enabled=false` in `fc-host`'s `/etc/wsl.conf`. Results then stay in `/var/lib/fc-sandbox/results` inside the distro, and `fc.ps1` (which runs scripts from `/mnt/c`) is unavailable until automount is re-enabled.
 - **Windows (Hyper-V Utility VM):** Every Windows guest runs with `--isolation=hyperv` inside a dedicated Hyper-V Utility VM (`vmwp.exe`) with its own Windows kernel, and files are streamed in and out via `tar.exe` over `HVSocket` rather than mounting a writable host directory. It does not defend against Hyper-V (`vmwp.exe` / VMBus) escape vulnerabilities. Compared with the Linux path there is one layer fewer (no surrounding WSL VM), and the host components that carry guest exec traffic (`vmcompute.exe`, `dockerd.exe`) run as `SYSTEM`.
 - **Windows networked mode is enforced by the egress proxy, not by Windows networking.** Windows 11 accepts HNS endpoint ACLs on NAT networks but doesn't enforce them, and Windows Firewall rules don't reliably filter traffic forwarded from containers. An earlier HNS-based design let guests reach the LAN and host services. The proxy is the only new host code that reads guest data: it parses fixed-size binary frames (no HTTP), limits frame size, stream count and idle time, and runs without admin rights. It sees only TCP connection requests, not traffic inside TLS.

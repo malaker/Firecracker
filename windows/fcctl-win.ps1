@@ -26,7 +26,14 @@ param(
     # run: write {"run_id","results_dir"} here as soon as the VM has an id (used by the MCP server).
     [string]$RunInfoFile,
     # put: guest folder (default C:\work\in). get: host folder (must not exist or be empty).
-    [string]$Dest
+    [string]$Dest,
+    # audit: the program (a file, or a folder plus -Entry), its arguments, top-level names of a folder
+    # sample to leave out, and where to stage the copy (default: the temp folder).
+    [string]$Sample,
+    [string]$Entry,
+    [AllowEmptyString()][string]$Arguments = '',
+    [string[]]$Exclude,
+    [string]$StagingDir
 )
 
 $ErrorActionPreference = 'Stop'
@@ -37,6 +44,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'lib\egress.ps1')
 . (Join-Path $PSScriptRoot 'lib\net.ps1')
 . (Join-Path $PSScriptRoot 'lib\airlock.ps1')
+. (Join-Path $PSScriptRoot 'lib\audit.ps1')
 . (Join-Path $PSScriptRoot 'lib\doctor.ps1')
 
 $cfg = Get-FcWinConfig
@@ -65,6 +73,12 @@ Commands:
   get <run-id> <guest-path> [-Dest <host-dir>]
                              Copy a guest file or folder out of a started VM through the guest
                              output airlock (default runs\<run-id>\files; exit 1 if refused)
+  audit -Guest windows -Sample PATH [-Entry FILE] [-Arguments 'ARGS'] [-Net MODE] [vm options]
+                             Run a Windows program in disposable VMs (isolated, then networked
+                             unless -Net is given) and write audit-report.md/.json into each
+                             runs\<run-id>\: hosts contacted, files and registry changed, outputs.
+                             -Exclude NAME[,NAME] leaves top-level entries of a folder -Sample out,
+                             -StagingDir DIR stages the copy there; -Timeout limits the program (5m)
   list                       List VMs (running, dead or kept)
   stop <run-id>              Destroy a VM (and kept disk/container)
   cleanup                    Destroy every VM and remove all leftovers
@@ -100,9 +114,12 @@ try {
     if ($Net -notin @('isolated', 'networked')) {
         throw "-Net must be 'isolated' or 'networked'."
     }
+    # audit without -Net does both runs, isolated then networked (spec: sandbox-audit).
+    $auditModes = if ($PSBoundParameters.ContainsKey('Net')) { @($Net) } else { @('isolated', 'networked') }
     $allowCsv = if ($Allow) { ($Allow -join ',') } else { '' }
     if ($allowCsv) {
-        if ($Net -ne 'networked') {
+        $hasNetworked = if ($Command -eq 'audit') { $auditModes -contains 'networked' } else { $Net -eq 'networked' }
+        if (-not $hasNetworked) {
             throw "-Allow only applies to -Net networked."
         }
         [void](Assert-ValidCidrList $allowCsv)
@@ -112,7 +129,7 @@ try {
     Stop-FcWithError $_.Exception.Message $script:EXIT_INFRA
 }
 # Refuse features the selected runtime cannot support before anything is started.
-if ($Net -eq 'networked') { Assert-FcWinFeatureSupported 'networked' $WinRuntime }
+if ($Net -eq 'networked' -or ($Command -eq 'audit' -and $auditModes -contains 'networked')) { Assert-FcWinFeatureSupported 'networked' $WinRuntime }
 
 function Complete-FcWinRunResults {
     param(
@@ -123,7 +140,8 @@ function Complete-FcWinRunResults {
         [Parameter(Mandatory = $true)][string]$PayloadPath,
         [Parameter(Mandatory = $true)][int]$ExitCode,
         [bool]$TimedOut = $false,
-        [string]$ErrorMessage = ''
+        [string]$ErrorMessage = '',
+        $Audit = $null
     )
     $outFilesDir = Join-Path $OutRunDir 'out'
     New-Item -ItemType Directory -Force -Path $outFilesDir | Out-Null
@@ -148,7 +166,7 @@ function Complete-FcWinRunResults {
     Write-FcTextFile -Path (Join-Path $OutRunDir 'exit_code') -Text "$ExitCode`n"
     Write-FcWinRunResultMeta -ResultsDir $OutRunDir -RunId $RunId -CommandText $CommandText `
         -PayloadPath $PayloadPath -ExitCode $ExitCode -TimedOut $TimedOut -ErrorMessage $ErrorMessage `
-        -Collection $collection -VmMeta $vmMeta
+        -Collection $collection -VmMeta $vmMeta -Audit $Audit
 }
 
 function Remove-FcWinVmInstance([string]$RunId, [bool]$ForceDeleteKeep = $false) {
@@ -287,6 +305,16 @@ function Start-NewFcWinVm([int]$LifetimeSec) {
 switch ($Command) {
     'doctor' {
         $rc = Invoke-WinDoctor -WinRuntime $WinRuntime -ImageRepo $ImageRepo -Flavour $Flavour -Boot:$Boot
+        exit $rc
+    }
+
+    'audit' {
+        Assert-FcAdmin
+        if ([string]::IsNullOrWhiteSpace($Sample)) { Stop-FcWithError "audit requires -Sample <program file or folder>" $script:EXIT_INFRA }
+        New-Item -ItemType Directory -Force -Path $ResultsDir | Out-Null
+        $rc = Invoke-FcWinAudit -Sample $Sample -Entry $Entry -Exclude @($Exclude | Where-Object { $_ }) -Arguments $Arguments `
+            -StagingDir $StagingDir -Modes $auditModes -WinRuntime $WinRuntime -ImageRepo $ImageRepo -Flavour $Flavour `
+            -Vcpu $Vcpu -MemMib $MemMib -AllowCsv $allowCsv -TimeoutSec $timeoutSec -Keep ([bool]$Keep) -ResultsDir $ResultsDir
         exit $rc
     }
 

@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="FcAudit.Core/FcAudit.Core.csproj" />
+  <Project Path="FcAudit.Tests/FcAudit.Tests.csproj" />
+  <Project Path="FcAudit/FcAudit.csproj" />
+  <Project Path="../windows/common/FcWinToken/FcWinToken.csproj" />
+</Solution>
