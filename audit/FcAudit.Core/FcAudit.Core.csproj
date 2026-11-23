@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Parsers and report writers for 'fc.ps1 audit'. They read guest-derived data (snapshots,
+       net.log), so they only ever run in fc-audit's restricted 'report' child (design D4). -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsTrimmable>true</IsTrimmable>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="FcAudit.Tests" />
+  </ItemGroup>
+
+</Project>

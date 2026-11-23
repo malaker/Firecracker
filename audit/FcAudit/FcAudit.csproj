@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- fc-audit: 'report' builds an audit report from a run folder; 'launch-report' runs 'report'
+       with a restricted, non-admin token from the elevated Windows controller.
+       Published self-contained (single file, trimmed) for win-x64 by setup. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>fc-audit</AssemblyName>
+    <RootNamespace>FcAudit</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <UseSystemResourceKeys>true</UseSystemResourceKeys>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\FcAudit.Core\FcAudit.Core.csproj" />
+    <ProjectReference Include="..\..\windows\common\FcWinToken\FcWinToken.csproj" />
+  </ItemGroup>
+
+</Project>

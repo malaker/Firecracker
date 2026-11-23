@@ -149,7 +149,9 @@ function Write-FcWinRunResultMeta {
         # How out\ was collected through the airlock: status, reason, files, bytes.
         $Collection = $null,
         # VM state captured before the VM was released (its state dir may be gone by now).
-        $VmMeta = $null
+        $VmMeta = $null,
+        # Audit runs (spec: sandbox-audit): what was audited, recorded under 'audit'.
+        $Audit = $null
     )
     $vmMeta = if ($VmMeta) { $VmMeta } else { Get-FcWinVmMeta $RunId }
     if (-not $vmMeta) { return }
@@ -181,6 +183,7 @@ function Write-FcWinRunResultMeta {
         keep_disk   = [bool]$vmMeta.keep_disk
         collection  = $Collection
     }
+    if ($null -ne $Audit) { $meta.audit = $Audit }
     $metaPath = Join-Path $ResultsDir 'meta.json'
     $tmpPath  = "$metaPath.tmp"
     $meta | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $tmpPath -Encoding utf8

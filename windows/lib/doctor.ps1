@@ -74,6 +74,10 @@ function Invoke-WinDoctor {
         "rerun '.\fc.ps1 setup -Guest windows' in an elevated prompt (needs the .NET 10 SDK)" `
         { Test-FcWinAirlockPresent }
 
+    Test-Check "audit report tool (fc-audit.exe)" `
+        "rerun '.\fc.ps1 setup -Guest windows' in an elevated prompt (needs the .NET 10 SDK)" `
+        { Test-FcWinAuditPresent }
+
     Test-Check "Windows runtime '$WinRuntime' binaries installed" `
         "run '.\fc.ps1 setup -Guest windows -WinRuntime $WinRuntime'" `
         { Test-FcWinRuntimeBinariesPresent $WinRuntime }

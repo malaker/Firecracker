@@ -188,5 +188,11 @@ if ($LASTEXITCODE -ne 0) {
     Stop-FcWithError "Building the guest output airlock tool failed (see the message above)." $script:EXIT_INFRA
 }
 
+# 8. Audit report tool for 'fc.ps1 audit' (needs the .NET 10 SDK, like the airlock tool).
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path (Split-Path -Parent $PSScriptRoot) 'audit\install-audit.ps1') -Rid win-x64 | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Stop-FcWithError "Building the audit report tool failed (see the message above)." $script:EXIT_INFRA
+}
+
 Write-FcLog "Windows Nano Server microVM setup complete (runtime=$WinRuntime, image=$imageRef)."
 exit 0
